@@ -1148,8 +1148,6 @@ class CustomSampler(Sampler):
         # path.
         simplified = []
         for step in steps:
-            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
-            self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
             alt = step.alt()
             if alt:
                 step = alt
@@ -1179,6 +1177,19 @@ class CustomSampler(Sampler):
                     for prep_step in prep_steps:
                         self.steps.append(prep_step())
                 self.steps.append(step)
+
+        # Keep speculative batching opt-in and deterministic. Stateful sampling and
+        # stochastic RNG schedules must remain serial, even without past-ID needs.
+        self.supports_batch_verify = len(self.steps) == 1 and (
+            type(self.steps[0]) is SS_Argmax or
+            (type(self.steps[0]) is SS_Fused and self.steps[0].mode == SS_Fused.MODE_GREEDY)
+        )
+
+        # Requirements belong to the executed stack, not removed identity steps.
+        # Include replacements, fused tails and any inserted preparation steps.
+        for step in self.steps:
+            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
+            self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
 
 
     @override

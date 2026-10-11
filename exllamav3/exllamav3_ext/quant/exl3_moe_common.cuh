@@ -56,3 +56,46 @@
                                                 \
     const int count_lo,                         \
     const int count_hi
+
+#define EXL3_MOE_MIXEDK_KERNEL_ARGS             \
+    const half* __restrict__ hidden_state,      \
+    half* __restrict__ temp_state_g,            \
+    half* __restrict__ temp_state_u,            \
+    half* __restrict__ temp_intermediate_g,     \
+    half* __restrict__ temp_intermediate_u,     \
+    float* __restrict__ output_state,           \
+                                                \
+    const uint16_t** __restrict__ gate_trellis, \
+    const half** __restrict__ gate_suh,         \
+    const half** __restrict__ gate_svh,         \
+    const uint16_t** __restrict__ up_trellis,   \
+    const half** __restrict__ up_suh,           \
+    const half** __restrict__ up_svh,           \
+    const uint16_t** __restrict__ down_trellis, \
+    const half** __restrict__ down_suh,         \
+    const half** __restrict__ down_svh,         \
+                                                \
+    const int64_t* __restrict__ expert_count,   \
+    const int64_t* __restrict__ token_sorted,   \
+    const half* __restrict__ weight_sorted,     \
+                                                \
+    const int hidden_dim,                       \
+    const int intermediate_dim,                 \
+    const int num_experts,                      \
+    const int num_experts_per_tok,              \
+    const int max_tokens_per_expert,            \
+    const int concurrency,                      \
+    const float act_limit,                      \
+    const int act_function,                     \
+    const int* __restrict__ K_gate_arr,         \
+    const int* __restrict__ K_up_arr,           \
+    const int* __restrict__ K_down_arr,         \
+                                                \
+    int* __restrict__ locks,                    \
+                                                \
+    float* __restrict__ output_scratch,         \
+    const int64_t* __restrict__ fused_base,     \
+                                                \
+    const int count_lo,                         \
+    const int count_hi
+

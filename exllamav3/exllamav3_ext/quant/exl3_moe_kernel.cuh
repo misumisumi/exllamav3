@@ -26,9 +26,13 @@
 // B dequant over more rows and are launched separately over the experts whose token count
 // warrants them ([count_lo, count_hi], see exl3_moe). Separate instances rather than one
 // kernel with a runtime tier switch: the tiers' register frames would otherwise share one
-// 128-register budget and the 16-row path pays for tiles it never runs. On RDNA the inner implements
-// the 16-row tile only; the wide tiles come from the pipelined mainloop below
-template<int t_bits, int cb, int MT, int N_TILE, bool t_half>
+// 128-register budget and the 16-row path pays for tiles it never runs (measured +60-70% on
+// Ada/Ampere for that arrangement)
+// SH / FS_IN: shared-memory stage ring and fragment-pipeline depth. Defaults reproduce the
+// original shape (MOE_SH_STAGES / MOE_FRAG_STAGES, 2 for the 64-row tile); the mixed-K kernel
+// carries them as template parameters so deeper-pipeline variants can be built and selected at
+// launch without touching the uniform instances.
+template<int t_bits, int cb, int MT, int N_TILE, bool t_half = false, int SH = MOE_SH_STAGES, int FS_IN = 0>
 __device__ __forceinline__
 void moe_gemm_tile
 (
@@ -43,11 +47,10 @@ void moe_gemm_tile
 )
 {
     // Fragment pipeline depth: the 64-row tile keeps two B stages so its A fragments fit
-    constexpr int FS = (MT >= 64) ? 2 : MOE_FRAG_STAGES;
+    constexpr int FS = (FS_IN > 0) ? FS_IN : ((MT >= 64) ? 2 : MOE_FRAG_STAGES);
     #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr
-    #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
-    // Compile-time rate: t_bits, or t_bits + 0.5 with t_half (mul1 codebook only). Otherwise the runtime K
-    // arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd = the
+    #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, SH, FS
+    // Runtime K arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd = the
     // half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, the host checks)
     if constexpr (t_bits)
         exl3_gemm_kernel_inner<t_bits, t_half, false, cb, SHAPE_ARGS, false>(ARGS);
@@ -396,6 +399,227 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     // Retire group; last group out resets the scheduler for the next launch. The acq_rel increment orders each
     // group's earlier ticket grabs before the last group's reset (plain atomics are relaxed, so without this a
     // straggler's in-flight grab could land after the reset and leak into the next launch)
+    if (block_idx == 0 && threadIdx.x == 0)
+    {
+        cuda::atomic_ref<int, cuda::thread_scope_device> next_ticket(sched[0]);
+        cuda::atomic_ref<int, cuda::thread_scope_device> retired_groups(sched[1]);
+        int retired = retired_groups.fetch_add(1, cuda::memory_order_acq_rel);
+        if (retired == num_groups - 1)
+        {
+            next_ticket.store(0, cuda::memory_order_relaxed);
+            retired_groups.store(0, cuda::memory_order_relaxed);
+        }
+    }
+}
+
+
+// Mixed-K per-expert kernel: K varies per expert, always uses the runtime K dispatch (t_bits=0)
+template<int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M,
+         int SH = MOE_SH_STAGES, int FS = 0>
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
+void exl3_moe_mixedk_kernel(EXL3_MOE_MIXEDK_KERNEL_ARGS)
+{
+    const int group_idx = blockIdx.z;
+    const int block_idx = blockIdx.x;
+    const int group_size = gridDim.x;
+    const int num_groups = gridDim.z;
+    const int block_threads = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
+    const int group_threads = group_size * block_threads;
+    const int warp_id = threadIdx.x / 32;
+    const int warps_per_group = group_threads / 32;
+    const int warps_per_block = block_threads / 32;
+    const int warp_idx0 = block_idx * warps_per_block + warp_id;
+
+    temp_state_g += group_idx * max_tokens_per_expert * hidden_dim;
+    temp_state_u += group_idx * max_tokens_per_expert * hidden_dim;
+    temp_intermediate_g += group_idx * max_tokens_per_expert * intermediate_dim;
+    temp_intermediate_u += group_idx * max_tokens_per_expert * intermediate_dim;
+
+    int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
+    int* sched = locks + MOE_SCHED_OFFSET;
+    locks += group_idx * MAX(hidden_dim, intermediate_dim) / 128;
+
+    int ticket = group_idx;
+
+    int start = 0;
+    int end = 0;
+    int expert_idx = 0;
+    int expert_idx_assign = 0;
+    for (; expert_idx < num_experts; ++expert_idx)
+    {
+        start = end;
+        end += expert_count[expert_idx];
+        int token_count = end - start;
+
+        if (token_count == 0) continue;
+        if (token_count > max_tokens_per_expert) continue;
+        if (token_count < count_lo || token_count > count_hi) continue;
+
+        if (expert_idx_assign++ != ticket) continue;
+
+        // Per-expert K values from the arrays
+        const int K_gate = K_gate_arr[expert_idx];
+        const int K_up = K_up_arr[expert_idx];
+        const int K_down = K_down_arr[expert_idx];
+
+        const uint16_t* exp_gate_trellis = gate_trellis[expert_idx];
+        const half* exp_gate_suh = gate_suh[expert_idx];
+        const half* exp_gate_svh = gate_svh[expert_idx];
+        const uint16_t* exp_up_trellis = up_trellis[expert_idx];
+        const half* exp_up_suh = up_suh[expert_idx];
+        const half* exp_up_svh = up_svh[expert_idx];
+        const uint16_t* exp_down_trellis = down_trellis[expert_idx];
+        const half* exp_down_suh = down_suh[expert_idx];
+        const half* exp_down_svh = down_svh[expert_idx];
+
+        const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
+        auto had_gather_gu_in = [&]()
+        {
+            const int warps_per_token = hidden_dim / 128;
+            const int total_warps = token_count * warps_per_token;
+            const int64_t* top_x = token_sorted + start;
+            for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
+            {
+                int token_idx = top_x[warp_idx / warps_per_token];
+                int token_off = warp_idx % warps_per_token;
+                const half* in_ptr = hidden_state + token_idx * hidden_dim + token_off * 128;
+                if (gated)
+                    had_hf_r_128_inner<true, false>
+                    (
+                        in_ptr,
+                        temp_state_g + 128 * warp_idx,
+                        exp_gate_suh + 128 * token_off,
+                        0.088388347648f
+                    );
+                had_hf_r_128_inner<true, false>
+                (
+                    in_ptr,
+                    temp_state_u + 128 * warp_idx,
+                    exp_up_suh + 128 * token_off,
+                    0.088388347648f
+                );
+            }
+            group_barrier(group_idx, group_size, barrier_counters_sense);
+        };
+
+        had_gather_gu_in();
+
+        auto gemm = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K,
+                        const int size_k, const int size_n)
+        {
+            int size_m = token_count;
+            while (size_m > 0)
+            {
+                int tm;
+                if constexpr (M_TILE >= 64)
+                {
+                    if (size_m > 32)      { moe_gemm_tile<0, cb, 64, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
+                    else if (size_m > 16) { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                }
+                else if constexpr (M_TILE == 32)
+                {
+                    if (size_m > 16)      { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                }
+                else
+                {
+                    moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
+                }
+                in_addr += tm * size_k;
+                out_addr += tm * size_n;
+                size_m -= tm;
+            }
+        };
+        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
+        {
+            gemm(in_addr, out_addr, trellis, K, hidden_dim, intermediate_dim);
+        };
+
+        if (gated)
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+        group_barrier(group_idx, group_size, barrier_counters_sense);
+
+        auto had_guad = [&]()
+        {
+            const int warps_per_token = intermediate_dim / 128;
+            const int total_warps = token_count * warps_per_token;
+            for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
+            {
+                int token_off = warp_idx % warps_per_token;
+                had_hf_r_128_guad_inner
+                (
+                    temp_intermediate_g + 128 * warp_idx,
+                    temp_intermediate_u + 128 * warp_idx,
+                    temp_intermediate_g + 128 * warp_idx,
+                    exp_gate_svh + 128 * token_off,
+                    exp_up_svh + 128 * token_off,
+                    exp_down_suh + 128 * token_off,
+                    0.088388347648f,
+                    act_limit,
+                    act_function
+                );
+            }
+            group_barrier(group_idx, group_size, barrier_counters_sense);
+        };
+
+        had_guad();
+
+        auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
+        {
+            gemm(in_addr, out_addr, trellis, K, intermediate_dim, hidden_dim);
+        };
+
+        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        group_barrier(group_idx, group_size, barrier_counters_sense);
+
+        auto had_d_out = [&]()
+        {
+            const int warps_per_token = hidden_dim / 128;
+            const int total_warps = token_count * warps_per_token;
+            const int64_t* top_x = token_sorted + start;
+            const half* weights = weight_sorted + start;
+            const int64_t slot_base = output_scratch ? fused_base[expert_idx] : 0;
+            for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
+            {
+                int row = warp_idx / warps_per_token;
+                int token_idx = top_x[row];
+                half weight = weights[row];
+                int token_off = warp_idx % warps_per_token;
+                if (output_scratch)
+                {
+                    float* out_ptr = output_scratch + (slot_base + row) * hidden_dim + token_off * 128;
+                    had_hf_r_128_d_inner<false>
+                    (
+                        temp_state_g + 128 * warp_idx,
+                        out_ptr,
+                        exp_down_svh + 128 * token_off,
+                        0.088388347648f * __half2float(weight)
+                    );
+                }
+                else
+                {
+                    float* out_ptr = output_state + token_idx * hidden_dim + token_off * 128;
+                    had_hf_r_128_d_inner<true>
+                    (
+                        temp_state_g + 128 * warp_idx,
+                        out_ptr,
+                        exp_down_svh + 128 * token_off,
+                        0.088388347648f * __half2float(weight)
+                    );
+                }
+            }
+        };
+
+        had_d_out();
+
+        if (block_idx == 0 && threadIdx.x == 0)
+            sched[2 + group_idx] = num_groups + atomicAdd(&sched[0], 1);
+        group_barrier(group_idx, group_size, barrier_counters_sense);
+        ticket = sched[2 + group_idx];
+    }
+
     if (block_idx == 0 && threadIdx.x == 0)
     {
         cuda::atomic_ref<int, cuda::thread_scope_device> next_ticket(sched[0]);

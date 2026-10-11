@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn.functional as F
 from ...util.tensor import get_for_device, buffered_arange
@@ -8,6 +9,14 @@ from ...ext import exllamav3_ext as ext
 # so it only makes sense for short sequences (decode and SD verification steps)
 MAX_CUDA_SEQLEN = 32
 MAX_CUDA_K = 16
+
+# Diagnostic compatibility option for the pre-1.6 bf16 Triton convolution.
+# The original kernel rounded bf16 * bf16 products before fp32 accumulation.
+# Applies only when x, state and weight are all bf16; other dtype paths and the
+# short-sequence CUDA kernel retain their current arithmetic. Combine with
+# EXL3_GDN_PROJ_FP32=1 and EXL3_GDN_CONV_TOKEN_MAJOR=0 to reproduce the old
+# split-Qwen prefill inputs. Disabled until whole-model paired validation.
+_legacy_bf16_product = os.environ.get("EXL3_GDN_CONV_BF16_PRODUCT", "0") != "0"
 
 import triton
 import triton.language as tl
@@ -29,6 +38,7 @@ def _causal_conv1d_update_slotted_kernel(
     has_bias: tl.constexpr,
     transpose_output: tl.constexpr,
     token_major: tl.constexpr,   # x is (bsz, seq, dim) instead of (bsz, dim, seq)
+    legacy_bf16_product: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -71,7 +81,13 @@ def _causal_conv1d_update_slotted_kernel(
             ).to(tl.float32)
             vals = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
             w = tl.load(weight + offs_d * conv_kernel_size + k, mask = mask_d, other = 0.0)
-            acc += vals * w[:, None]
+            if legacy_bf16_product:
+                # Keep the explicit product rounding: widening the operands
+                # before multiplication changes recurrent prefill state.
+                product = (vals.to(tl.bfloat16) * w[:, None]).to(tl.bfloat16)
+                acc += product.to(tl.float32)
+            else:
+                acc += vals * w[:, None]
 
     if has_bias:
         b = tl.load(bias + offs_d, mask = mask_d, other = 0.0)
@@ -137,6 +153,7 @@ def _causal_conv1d_update_slotted_output_kernel(
     has_bias: tl.constexpr,
     transpose_output: tl.constexpr,
     token_major: tl.constexpr,
+    legacy_bf16_product: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -176,7 +193,13 @@ def _causal_conv1d_update_slotted_output_kernel(
             ).to(tl.float32)
             vals = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
             w = tl.load(weight + offs_d * conv_kernel_size + k, mask = mask_d, other = 0.0)
-            acc += vals * w[:, None]
+            if legacy_bf16_product:
+                # Keep the explicit product rounding: widening the operands
+                # before multiplication changes recurrent prefill state.
+                product = (vals.to(tl.bfloat16) * w[:, None]).to(tl.bfloat16)
+                acc += product.to(tl.float32)
+            else:
+                acc += vals * w[:, None]
 
     if has_bias:
         b = tl.load(bias + offs_d, mask = mask_d, other = 0.0)
@@ -262,11 +285,15 @@ def causal_conv1d_update_slotted_triton(
     history: bool = False,
     token_major: bool = False,
     out_dtype: torch.dtype | None = None,
+    legacy_bf16_product: bool | None = None,
 ) -> torch.Tensor:
     """
     token_major: x is (bsz, seq, dim), e.g. a projection output read in place, instead of the
     (bsz, dim, seq) layout; any float dtype (values are widened to fp32 in the kernel, so an
     fp16 projection needs no bf16 copy). out_dtype defaults to x's dtype.
+    legacy_bf16_product rounds bf16 products before fp32 accumulation, matching
+    the pre-1.6 kernel. None selects EXL3_GDN_CONV_BF16_PRODUCT for all-bf16
+    inputs only; an explicit True requires bf16 x, state and weight.
     """
     if not x.is_cuda:
         raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA tensors")
@@ -280,6 +307,14 @@ def causal_conv1d_update_slotted_triton(
         raise RuntimeError(f"weight is on {weight.device}, expected {x.device}")
     if bias is not None and bias.device != x.device:
         raise RuntimeError(f"bias is on {bias.device}, expected {x.device}")
+
+    all_bf16 = x.dtype == conv_state.dtype == weight.dtype == torch.bfloat16
+    if legacy_bf16_product is None:
+        legacy_bf16_product = _legacy_bf16_product and all_bf16
+    elif type(legacy_bf16_product) is not bool:
+        raise TypeError("legacy_bf16_product must be a bool or None")
+    if legacy_bf16_product and not all_bf16:
+        raise ValueError("legacy_bf16_product requires bf16 x, conv_state and weight")
 
     if token_major:
         bsz, seq_len, dim = x.shape
@@ -324,6 +359,7 @@ def causal_conv1d_update_slotted_triton(
                 bias is not None,
                 transpose_output,
                 token_major,
+                legacy_bf16_product,
                 BLOCK_D = block_d,
                 BLOCK_S = block_s,
                 BLOCK_K = block_k,
@@ -347,6 +383,7 @@ def causal_conv1d_update_slotted_triton(
                 bias is not None,
                 transpose_output,
                 token_major,
+                legacy_bf16_product,
                 BLOCK_D = block_d,
                 BLOCK_S = block_s,
                 BLOCK_K = block_k,

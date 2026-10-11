@@ -6,6 +6,8 @@ class Sampler:
     def __init__(self):
         self.reqs_past_ids = False
         self.reqs_torch_seed = False
+        # History independence alone does not prove position-wise batch safety.
+        self.supports_batch_verify = False
 
     @abstractmethod
     def forward(

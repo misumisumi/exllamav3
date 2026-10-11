@@ -545,7 +545,7 @@ def print_quantized_linear(config, linear, quant_args, proxy_err, time_str = "")
     )
 
 
-def group_quant_linears(linears, strategy, capture_H, max_cat_cols = 32768, max_stack = 16):
+def group_quant_linears(linears, strategy, capture_H, max_cat_cols = 500000, max_stack = 2048):
     """
     Partition linears into groups for batched quantization. Tensors sharing a Hessian (same qmap) at the same
     bitrate concatenate along out_features; leftover same-shape, same-bitrate tensors with individual Hessians
@@ -571,7 +571,7 @@ def group_quant_linears(linears, strategy, capture_H, max_cat_cols = 32768, max_
             loners.setdefault((linear.in_features, linear.out_features, K), []).append(linear)
             continue
         # Shared-Hessian group: chunk by total column count
-        cap = max(ls[0].out_features, min(max_cat_cols, int(3.5e8) // k))
+        cap = max(ls[0].out_features, min(max_cat_cols, int(5e10) // k))
         chunk, cols = [], 0
         for linear in ls:
             if chunk and cols + linear.out_features > cap:
@@ -584,7 +584,7 @@ def group_quant_linears(linears, strategy, capture_H, max_cat_cols = 32768, max_
 
     for (k, n, K), ls in loners.items():
         # Same-shape stacking group: chunk by batch size
-        cap = max(1, min(max_stack, int(3.5e8) // (k * n)))
+        cap = max(1, min(max_stack, int(5e10) // (k * n)))
         for i in range(0, len(ls), cap):
             groups.append(ls[i : i + cap])
 

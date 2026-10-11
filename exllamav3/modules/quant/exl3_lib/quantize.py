@@ -11,6 +11,16 @@ from ....util.tensor import save_tensor_image
 from functools import lru_cache
 import threading
 
+# Experiment hook: EXL3_LDLQ_DTYPE=tf32 runs every fp32 matmul in the encoder (the LDLQ error-feedback
+# GEMMs dominate the encode) on TF32 tensor cores. Unset = stock fp32 behaviour.
+if os.environ.get("EXL3_LDLQ_DTYPE", "").lower() == "tf32":
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+    except Exception:
+        pass
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
 # Constant
 had_k, had_n = 128, 128
 codebook_scale = 1.24371088
@@ -88,7 +98,7 @@ def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
     # The kernel runs one block per tile and caps each wave at min(temp_costs.size(0), 2 * SMs). At K >= 4 the
     # temp buffers are cheap enough to size for full occupancy on large GPUs (+17% throughput on GB202 at big
     # batches); at lower K, temp_edges is multiple GB already and 256 stays the cap
-    max_batch_size = 256
+    max_batch_size = 2048
     if K >= 4:
         mp_count = torch.cuda.get_device_properties(device).multi_processor_count
         # The kernel may run up to 1024 / threads blocks per SM (see quantize_tiles_kernel.cuh)
@@ -581,6 +591,23 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_in
     return L, H  # , D.to(DL.device)
 
 
+def _ldlq_precision():
+    """
+    Experiment hook. EXL3_LDLQ_DTYPE=tf32|bf16 runs the LDLQ error-feedback GEMMs at reduced precision;
+    unset keeps the stock fp32 path bit-for-bit.
+    """
+    import os
+    dp = os.environ.get("EXL3_LDLQ_DTYPE", "").lower()
+    if dp == "tf32":
+        try:
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+        except Exception:
+            pass
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    return dp
+
+
 def ldlq(
     weight: torch.Tensor,
     L: torch.Tensor,
@@ -944,6 +971,7 @@ def ldlq_batched(
          - indices (unpacked), shape (B, k // 16, n // 16, 256), int16
     """
     devices = quant_args["devices"]
+    dp = _ldlq_precision()
     for device in devices:
         torch.cuda.synchronize(device)
     main_stream = get_quant_stream(devices[0])
@@ -985,7 +1013,14 @@ def ldlq_batched(
 
                 # Input tiles for quantization; out-of-place equivalent of ldlq()'s in-place accumulation
                 # (the mutated prod_cache rows are never read again there)
-                compensation = torch.baddbmm(prod_cache[:, gi:gj], bb_L.transpose(1, 2), bb_err)
+                if dp == "bf16":
+                    compensation = torch.baddbmm(
+                        prod_cache[:, gi:gj].to(torch.bfloat16),
+                        bb_L.transpose(1, 2).to(torch.bfloat16),
+                        bb_err.to(torch.bfloat16)
+                    ).to(torch.float)
+                else:
+                    compensation = torch.baddbmm(prod_cache[:, gi:gj], bb_L.transpose(1, 2), bb_err)
                 rows = weights[:, gi:gj] + compensation
 
                 tiles = rows.reshape(B, 16, tiles_n, 16).permute(0, 2, 1, 3).reshape(B * tiles_n, 256)
@@ -1004,7 +1039,14 @@ def ldlq_batched(
 
             # Cache error term for the rest of the matrices
             b_err = weights[:, i:j] - weight_q[:, i:j]
-            prod_cache.baddbmm_(Ls[:, i:j].transpose(1, 2), b_err)
+            if dp == "bf16":
+                prod_cache[:, i:j].copy_(torch.baddbmm(
+                    prod_cache[:, i:j].to(torch.bfloat16),
+                    Ls[:, i:j].transpose(1, 2).to(torch.bfloat16),
+                    b_err.to(torch.bfloat16)
+                ).to(torch.float))
+            else:
+                prod_cache.baddbmm_(Ls[:, i:j].transpose(1, 2), b_err)
 
         for device in devices:
             torch.cuda.synchronize(device)
@@ -1216,23 +1258,26 @@ def g_scale_search_batch(
         return out
 
     # Stage 1: coarse grid over the full search range, on a subsample of each tensor's tiles
-    coarse = [0.1 + 0.2 * i for i in range(10)]  # 0.1 .. 1.9, same range as the old golden-section bracket
-    subs = [s[::3] for s in samples]
+    coarse = [0.1 + (1.8 / (max(3, int(os.environ.get("EXL3_GS_COARSE", "10"))) - 1)) * i
+              for i in range(max(3, int(os.environ.get("EXL3_GS_COARSE", "10"))))]  # 0.1 .. 1.9 (count configurable for experiments)
+    _stride = max(1, int(os.environ.get("EXL3_GS_STRIDE", "3")))
+    subs = [s[:: _stride] for s in samples]
     pairs1 = [(t, s) for t in range(n_t) for s in coarse]
     mse1 = eval_pairs(pairs1, subs).view(n_t, len(coarse))
     centers = [coarse[c] for c in mse1.argmin(dim = 1).tolist()]
 
     # Stage 2: fine grid around each tensor's coarse minimum, on its full sample
-    step = 0.075
-    fine = [[c + step * (i - 2) for i in range(5)] for c in centers]
+    n_f = max(3, int(os.environ.get("EXL3_GS_FINE", "5")))
+    step = 0.3 / (n_f - 1)
+    fine = [[c + step * (i - (n_f - 1) / 2.0) for i in range(n_f)] for c in centers]
     pairs2 = [(t, s) for t in range(n_t) for s in fine[t]]
-    mse2 = eval_pairs(pairs2, samples).view(n_t, 5)
+    mse2 = eval_pairs(pairs2, samples).view(n_t, n_f)
     mse2_h = mse2.tolist()
 
     results = []
     for t in range(n_t):
-        best = min(range(5), key = lambda i: mse2_h[t][i])
-        if 0 < best < 4:
+        best = min(range(n_f), key = lambda i: mse2_h[t][i])
+        if 0 < best < n_f - 1:
             y0, y1, y2 = mse2_h[t][best - 1], mse2_h[t][best], mse2_h[t][best + 1]
             denom = y0 - 2.0 * y1 + y2
             offset = 0.5 * (y0 - y2) / denom if denom > 0 else 0.0

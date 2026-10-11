@@ -151,7 +151,7 @@ class BCAttn:
         self.num_kv_heads = module.num_kv_heads
         self.hidden_size = module.hidden_size
         self.sm_scale = module.sm_scale
-        self.window_size = module.sliding_window
+        self.window_size = module.window_arg() if hasattr(module, "window_arg") else module.sliding_window
         self.softcap = module.logit_softcapping
 
         self.quant = k_bits > 0
@@ -300,6 +300,8 @@ class BCAttn:
         from .triton_paged import (
             combine_subtiles,
             decode_row_layout,
+            decode_split_programs,
+            _decode_legacy_splits,
             _paged_attn_decode_split_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
@@ -315,11 +317,12 @@ class BCAttn:
         block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
         block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
         programs = bsz * kvh * h_blocks
+        split_programs = decode_split_programs(bsz, q_len, kvh, group_size, h_blocks)
 
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
         target = 2 * _get_sm_count(dev)
-        splits_cap = max(1, min(target // programs, 128))
+        splits_cap = max(1, min(target // split_programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
@@ -354,6 +357,12 @@ class BCAttn:
         } | {n: "constexpr" for n in (
             "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
             "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
+        if _decode_legacy_splits:
+            # Keep the original combine AOT pointer contract. On GB10, adding
+            # divisibility changes this reduction's rounding even when every
+            # split accumulator is bit-identical. Split-kernel alignment and
+            # packed rows remain enabled.
+            sig_c = {name: ty.removesuffix(":16") for name, ty in sig_c.items()}
         rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
@@ -677,6 +686,8 @@ def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
+        # The fused block only softpluses headwise gates; full gates use sigmoid.
+        not (m.full_gate and getattr(m, "gate_softplus", False)) and
         _qsa_module_eligible(m) and
         # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
         # kernel, so a norm-only module without rope has nowhere to apply them

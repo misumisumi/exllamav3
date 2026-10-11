@@ -1,1 +1,1 @@
-__version__ = "1.6.1"
+# Fork build: upstream 1.6.1 plus the GB10 and mixed-K runtime extensions.\n__version__ = "1.6.1.post1"\n

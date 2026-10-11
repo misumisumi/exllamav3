@@ -23,6 +23,10 @@ import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
+import os as _os
+_BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
+_MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
+
 class Generator:
 
     def __init__(
@@ -44,10 +48,11 @@ class Generator:
         recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
-        draft_confidence: float = 0.4,
+        draft_confidence: float | None = None,
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
+        draft_row_budget: int | None = None,
         **kwargs
     ):
         """
@@ -118,7 +123,14 @@ class Generator:
             everything before it is accepted too) drafting stops when the running product of conditional
             estimates - the probability that the next position actually contributes a token - falls below the
             target. Lower values keep longer drafts; higher values truncate more aggressively. Ignored for
-            n-gram drafting.
+            n-gram drafting. None (default) reads EXL3_DRAFT_CONFIDENCE from the environment, else 0.4, so
+            API servers that do not expose this knob (e.g. TabbyAPI) can still be tuned per deployment.
+
+        :param draft_row_budget:
+            Optional cap on batch_size * (draft_window + 1) for multi-sequence MTP verifies.
+            Single-stream drafting is unchanged. Zero disables the cap; None reads
+            EXL3_DRAFT_ROW_BUDGET (default 0). A zero-proposal round still prefills the
+            current MTP position so subsequent rounds never read unwritten draft cache.
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
@@ -206,6 +218,14 @@ class Generator:
         self.max_draft_tokens = max(self.num_draft_tokens, self.hybrid_draft_tokens)
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
+        if draft_row_budget is None:
+            try:
+                draft_row_budget = int(_os.environ.get("EXL3_DRAFT_ROW_BUDGET", "0"))
+            except ValueError as e:
+                raise ValueError("EXL3_DRAFT_ROW_BUDGET must be a nonnegative integer") from e
+        if type(draft_row_budget) is not int or draft_row_budget < 0:
+            raise ValueError("draft_row_budget must be a nonnegative integer")
+        self.draft_row_budget = draft_row_budget
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
@@ -307,6 +327,11 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        self._mtp_skipped_round = False
+        # DFlash writes its full native block even when verification is shortened.
+        self.draft_reserve_tokens = self.max_draft_tokens
+        if self.dflash_draft:
+            self.draft_reserve_tokens = max(self.num_draft_tokens, self.draft_model.config.block_size - 1)
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -315,6 +340,9 @@ class Generator:
         # leaving the calibrator inert
         self.draft_calibrator = None
         self._draft_conf_round = None
+        if draft_confidence is None:
+            draft_confidence = float(_os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
+        self.draft_confidence = draft_confidence
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
 
@@ -485,6 +513,8 @@ class Generator:
         """
 
         num_jobs = self.num_remaining_jobs()
+        if getattr(job, "token_budget", None) is not None:
+            job.clear_token_budget()
 
         if job in self.pending_jobs:
             self.pending_jobs.remove(job)
@@ -809,9 +839,18 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
+    def _mtp_window(self, batch_size: int) -> int:
+        """Bound MTP verify rows while preserving the single-stream draft length."""
+        full = self.num_draft_tokens
+        if batch_size <= 1 or full <= 0 or self.draft_row_budget == 0:
+            return full
+        return max(0, min(full, self.draft_row_budget // batch_size - 1))
+
+
     def iterate_draftmodel_mtp_gen(self, results: list):
 
         self._draft_conf_round = None
+        self._mtp_skipped_round = False
 
         # Get shape of active batch
         batch_size = 0
@@ -822,8 +861,10 @@ class Generator:
             batch_size += 1
         if batch_size == 0:
             return None
+        mtp_window = self._mtp_window(batch_size)
 
-        # Create block index table for batch
+        # Create block index table for batch. Keep draft staging separate from the target's
+        # in-flight buffers; pageable uploads would block each draft step.
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
         # pageable copies; the draft's own buffers, since the target's are still in flight
@@ -847,8 +888,10 @@ class Generator:
             if not job.is_prefill_done(): continue
             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
             if job.mtp_last_hidden is None:
-                # A one-token prompt has no token to prefill before the generation input.
-                # Run one normal target step first; iterate_gen() will initialize MTP state.
+                # A one-token prompt (or a rewind) has no valid carry yet. Run one
+                # normal target step, then commit the current MTP position for EVERY
+                # batch member before resuming drafts, including peers with a carry.
+                self._mtp_skipped_round = True
                 return None
             if job.time_first_token is None:
                 cuda_sync_active()
@@ -856,14 +899,47 @@ class Generator:
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
             mtp_hidden_list.append(job.mtp_last_hidden)
-        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
-        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
+        if mtp_window == 0:
+            # iterate_gen assumes position K has been written by the MTP pass. A wide
+            # batch may propose no tokens, but it must still commit that position before
+            # the target advances: otherwise a later smaller batch resumes with holes in
+            # the draft KV cache. No draft head or draft sampling runs on this path.
+            self.draft_model.prefill(
+                torch.cat(input_ids_list, dim = 0),
+                {
+                    "target_hidden": temp_hidden,
+                    "attn_mode": "flash_attn",
+                    "block_table": block_index,
+                    "cache": self.draft_cache,
+                    "cache_seqlens": cache_seqlens,
+                },
+            )
+            return None
+        # Device-resident draft chain (EXL3_MTP_DEVICE_DRAFT): ids stay on the draft device
+        # between steps (the Embedding mirrors its table there), so the window costs one
+        # readback instead of one per drafted token
+        dev_draft = _MTP_DEVICE_DRAFT and self.draft_calibrator is None and temp_hidden.is_cuda
+        if dev_draft:
+            ddev = temp_hidden.device
+            batch_ids = torch.cat(input_ids_list, dim = 0).to(ddev, non_blocking = True)
+            dev_draft_ids = torch.empty((batch_size, mtp_window), dtype = torch.long, device = ddev)
+            # Each pinned source must remain unchanged until its asynchronous H2D read
+            # completes. Device-resident drafting has no per-step sync, so an in-place
+            # increment of one shared cache_seqlens buffer races with those reads.
+            # Build immutable per-step rows once; the final token readback fences reuse.
+            cache_seqlens_steps = self._staging("draft_chain_seqlens", mtp_window, batch_size)
+            cache_seqlens_steps.copy_(
+                cache_seqlens[None, :] + torch.arange(mtp_window, dtype = torch.int32)[:, None]
+            )
+        else:
+            batch_ids = self.draft_input_ids_pinned[:batch_size, :]
+            batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
-        window = self.num_draft_tokens
+        window = mtp_window
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -873,7 +949,7 @@ class Generator:
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
                 "cache": self.draft_cache,
-                "cache_seqlens": cache_seqlens,
+                "cache_seqlens": cache_seqlens_steps[idx] if dev_draft else cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
             }
             if cal is not None:
@@ -882,9 +958,14 @@ class Generator:
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
-            cache_seqlens += 1
+            if dev_draft:
+                dev_draft_ids[:, idx:idx+1] = new_ids
+                batch_ids = new_ids
+            else:
+                self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+                batch_ids.copy_(new_ids)
+            if not dev_draft:
+                cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:
@@ -895,6 +976,11 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
+
+        if dev_draft:
+            # one readback for the whole window
+            self.draft_ids_pinned[:batch_size, :window].copy_(dev_draft_ids[:, :window])
+            return self.draft_ids_pinned[:, :window]
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -1341,11 +1427,45 @@ class Generator:
                 accepted_length = 1
                 rejected = 0
 
+                # Batched verify (EXL3_BATCH_VERIFY): sample every position of the verification
+                # window in one sampler call and compare against the draft on-device, so the
+                # round pays one launch->readback sync instead of one per position. Only for
+                # samplers whose per-position result does not depend on earlier positions in the
+                # same window (no past-id penalties, filters, forced tokens, phase budgets or prob exports),
+                # and which explicitly opt in to position-independent verification.
+                pre_tokens = None
+                pre_match = None
+                if (
+                    _BATCH_VERIFY and draft_tokens is not None and batch_logits.shape[1] > 1 and
+                    len(job.sequences) == 1 and not job.filters and job.forced_ids is None and
+                    getattr(job, "token_budget", None) is None and
+                    not job.return_probs and job.return_top_tokens == 0 and job.new_tokens >= 0 and
+                    not getattr(job.sampler, "reqs_past_ids", False) and job.device_logit_mask is None and
+                    getattr(job.sampler, "supports_batch_verify", False)
+                ):
+                    q_ = batch_logits.shape[1]
+                    all_tokens = job.sampler.forward(
+                        job_logits.view(q_, 1, -1),
+                        None,
+                        job.rng.randint(0, (1<<32)-1),
+                        self.tokenizer,
+                        logit_mask = None
+                    ).view(q_)
+                    d_ = draft_tokens[j, :q_ - 1].to(all_tokens.device, non_blocking = True)
+                    match_ = (all_tokens[:q_ - 1] == d_)
+                    packed_ = torch.cat([all_tokens, match_.to(all_tokens.dtype)]).cpu()   # single sync
+                    pre_tokens = packed_[:q_]
+                    pre_match = packed_[q_:].tolist()
+
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                        token_logits,
-                    )
+                    if pre_tokens is not None:
+                        next_token = pre_tokens[i:i + 1].view(1, 1)
+                        next_k_tokens = next_k_probs = next_prob = None
+                    else:
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                            token_logits,
+                        )
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
@@ -1400,7 +1520,9 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        mismatch_ = (not pre_match[i]) if pre_match is not None else \
+                            (draft_tokens[j, i].item() != sampled_token.item())
+                        if mismatch_ or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
@@ -1458,7 +1580,8 @@ class Generator:
                 conf = st["conf"][row]
                 ids_full = st["ids"][row]
                 row += 1
-                if id(job) in rewound_jobs:
+                # A pre-sample budget error has no target choice to train against.
+                if id(job) in rewound_jobs or getattr(job, "_token_budget_failed", False):
                     continue
                 a = accepted_length - 1
                 for i in range(a):
@@ -1518,14 +1641,33 @@ class Generator:
                 accepted_length = accepted_lengths[accepted_idx]
                 accepted_idx += 1
 
-                # A banned-string rewind invalidated this job's carry; leave it unset so drafting pauses until the
-                # next target forward provides a fresh one, and don't propagate hidden states from the abandoned
-                # window into the draft cache
-                if id(job) in rewound_jobs:
+                # A banned-string rewind invalidated this job's carry. A failed budget transition also ends
+                # the job without a usable continuation (possibly before any token was sampled).
+                # Do not propagate either abandoned window into the draft cache.
+                if id(job) in rewound_jobs or getattr(job, "_token_budget_failed", False):
                     continue
 
-                # Position K was drafted from the last target state already. Replace accepted
-                # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
+                # A missing carry paused drafting for the whole batch. Position K
+                # still needs its cache write, even for peers whose carry was valid.
+                # Initial zero carry matches ordinary MTP prefill at prompt position 0.
+                if self._mtp_skipped_round:
+                    carry = job.mtp_last_hidden
+                    if carry is None:
+                        carry = torch.zeros_like(target_hidden[a_idx:b_idx, :1, :])
+                    self.draft_model.prefill(
+                        batch_ids[a_idx:b_idx, :1],
+                        {
+                            "attn_mode": "flash_attn",
+                            "block_table": block_index[a_idx:b_idx],
+                            "cache": self.draft_cache,
+                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx],
+                            "target_hidden": carry,
+                        },
+                    )
+
+                # Position K was drafted from the last target state already (or
+                # maintained above). Replace accepted speculative positions K+1..K+A-1
+                # with the corresponding target-state inputs.
                 if accepted_length > 1:
                     self.draft_model.prefill(
                         batch_ids[a_idx:b_idx, 1:accepted_length],

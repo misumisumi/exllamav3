@@ -65,7 +65,8 @@ class Linear(Module):
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
         select_hq_bits: int = 0,
-        qgroup: str = None
+        qgroup: str = None,
+        load_bias: bool = True,
     ):
         super().__init__(config, key, qmap)
 
@@ -101,6 +102,8 @@ class Linear(Module):
         self.ftranspose_after_load = ftranspose_after_load
         self.select_hq_bits = select_hq_bits
         self.qgroup = qgroup or key
+        # Selection-only router biases (e.g. K2 Horizon) must not enter logits.
+        self.load_bias = load_bias
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
 
@@ -195,7 +198,7 @@ class Linear(Module):
             if self.used_alt_key and isinstance(key, list):
                 dev = self.device
                 weight = [self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True) for k in key]
-                bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
+                bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key] if self.load_bias else [None] * len(key)
                 weight = torch.cat(weight, dim = -1)
                 bias = torch.cat(bias, dim = -1) if bias[0] is not None else None
             else:
@@ -230,7 +233,7 @@ class Linear(Module):
                     rescaled = scale is not None or scale_inv is not None or self.weight_scale != 1.0
                     no_defer = rescaled
                     weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer, arena = not rescaled)
-                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer, arena = not rescaled)
+                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer, arena = not rescaled) if self.load_bias else None
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
                 elif scale_inv is not None:
@@ -435,7 +438,7 @@ class Linear(Module):
         trellis = stc.get_tensor(key + ".trellis", self.device)
         mcg = stc.get_codebook_marker(key + ".mcg", codebook_mcg_mult)
         mul1 = stc.get_codebook_marker(key + ".mul1", codebook_mul1_mult)
-        bias = opt(".bias", self.device)
+        bias = opt(".bias", self.device) if self.load_bias else None
         self.inner = LinearEXL3(
             self.config,
             self.in_features,
@@ -750,6 +753,7 @@ class Linear(Module):
                 "first_out_feature": self.first_out_feature,
                 "pre_scale": self.pre_scale,
                 "post_scale": self.post_scale,
+                "load_bias": self.load_bias,
             },
             # Not constructor args: restored post-construction by _adopt_inner_dims for dims the
             # split leaves whole (padded models pad the hidden dims, which are never split)

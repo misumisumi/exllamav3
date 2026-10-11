@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import math
 import torch
 from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
@@ -228,8 +229,8 @@ class Attention(Module):
         self.use_k_as_v = use_k_as_v
         self.full_gate = full_gate
         self.gate_softplus = gate_softplus
-        assert not gate_softplus or not (full_gate or interleaved_gate), \
-            "Attn: gate_softplus is only implemented for the headwise gate"
+        assert not gate_softplus or not interleaved_gate, \
+            "Attn: gate_softplus is not implemented for the interleaved gate"
         self.key_sinks = key_sinks
         self.sinks = None
 
@@ -947,7 +948,10 @@ class Attention(Module):
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        if self.full_gate and self.gate_softplus:
+            o.mul_(torch.nn.functional.softplus(g, beta = math.log(2)))
+        elif self.full_gate or self.interleaved_gate:
+            ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -1210,10 +1214,20 @@ class Attention(Module):
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        if self.full_gate and self.gate_softplus:
+            o.mul_(torch.nn.functional.softplus(g, beta = math.log(2)))
+        elif self.full_gate or self.interleaved_gate:
+            ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def window_arg(self):
+        """window_size for attn_dispatch: an int, or (left, right) when window_right is set"""
+        if self.window_right:
+            return (self.sliding_window, self.window_right)
+        return self.sliding_window
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:

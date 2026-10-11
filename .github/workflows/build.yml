@@ -1,5 +1,5 @@
 name: Build Wheels & Release
-run-name: Build Wheels & Release (${{ inputs.target }}, release=${{ inputs.release }})
+run-name: Build Wheels & Release (${{ inputs.target || 'all' }}, release=${{ github.event_name == 'push' && '1' || inputs.release }})
 
 on:
   workflow_dispatch:
@@ -22,9 +22,20 @@ on:
           - torch_212_213
           - rocm
           - sdist
+  # A tag push IS a release: REL below resolves to '1', the matrix is the full one (the target
+  # input is empty, so nothing filters it) and every asset publishes to the pushed tag.
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
+
+# inputs.release only exists for workflow_dispatch, so the release decision is resolved once
+# here: a tag push means release, everything else follows the input. Job-level `if` cannot see
+# the env context, so job conditions test github.event_name directly while steps use env.REL.
+env:
+  REL: ${{ github.event_name == 'push' && '1' || inputs.release }}
 
 jobs:
   # The wheel matrix is generated here rather than declared statically on build_wheels because
@@ -33,7 +44,7 @@ jobs:
   define_matrix:
     name: Define build matrix
     runs-on: ubuntu-22.04
-    if: inputs.target != 'sdist'
+    if: github.event_name == 'push' || inputs.target != 'sdist'
     outputs:
       matrix: ${{ steps.set_matrix.outputs.matrix }}
     steps:
@@ -45,7 +56,8 @@ jobs:
           import json
           import os
 
-          target = "${{ inputs.target }}"
+          # Empty on a tag push: that means the full matrix, same as `all`
+          target = "${{ inputs.target }}" or "all"
 
           oses = ["ubuntu-22.04", "windows-2022"]
           pyvers = ["3.10", "3.11", "3.12", "3.13.3", "3.14"]
@@ -125,6 +137,61 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": combos}) + "\n")
 
+  # Create the release before the matrix can race to create it (the build jobs only upload into
+  # an existing release): 60 jobs starting at once would otherwise all try to create the same
+  # tag's release. Publishing is skipped entirely for a dispatch with release=0.
+  prepare_release:
+    name: Prepare release
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || inputs.release == '1'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and tag
+        id: version
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^__version__[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' exllamav3/version.py | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error file=build.yml::Could not parse version from exllamav3/version.py!"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Publish to the tag that was pushed, so a mismatched tag cannot quietly open a
+            # second release
+            tag="${{ github.ref_name }}"
+            if [ "$tag" != "v$version" ]; then
+              echo "::warning file=build.yml::Pushed tag $tag does not match version v$version"
+            fi
+          else
+            tag="v$version"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create release if missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          version="${{ steps.version.outputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $tag already exists, leaving it as it is"
+            exit 0
+          fi
+          notes=$(printf '%s\n' \
+            "Prebuilt wheels for exllamav3 $version (fork build)." \
+            "" \
+            "Asset names are \`exllamav3-<version>+cu<CUDA>.torch<torch>-cp<py>-cp<py>-<platform>.whl\`: pick the row matching the torch and CUDA build you want, or read \"Prebuilt wheels\" in the README. Every wheel carries the fat CUDA arch list (8.0 8.6 8.9 9.0 10.0 12.0+PTX), so no local build or arch selection is needed." \
+            "A rolling pre-release of the latest master is tagged \`nightly\`.")
+          if [ "${{ github.event_name }}" = "push" ]; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes "$notes"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes "$notes" --target "$GITHUB_SHA"
+          fi
+          echo "Created release $tag"
+
   build_wheels:
     name: ${{ matrix.os }} P${{ matrix.pyver }} ${{ matrix.cuda && format('CUDA {0}', matrix.cuda) || format('ROCm {0}', matrix.rocm) }} T${{ matrix.torch }}
     needs: define_matrix
@@ -160,13 +227,29 @@ jobs:
         id: package_version
         run: |
           $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
-          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
-            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
-            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+          # Accepts an optional .postN/.devN/.rcN suffix so the fork's 1.5.1.post1 parses whole
+          # and a manual release publishes to the same tag its version implies
+          if ($versionString -match '__version__ = "([0-9]+(?:\.[0-9]+)*(?:\.?(?:post|dev|rc)[0-9]+)?)"') {
+            $version = $Matches[1]
+            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $version)
+            Write-Output "PACKAGE_VERSION=$version" >> "$env:GITHUB_OUTPUT"
+            if ("${{ github.event_name }}" -eq "push") {
+              # A tag push publishes to the tag that was pushed, never to a tag derived from the
+              # version, so the two cannot drift apart
+              $tag = "${{ github.ref_name }}"
+              if ($tag -ne "v$version") {
+                Write-Output $('::warning file=build.yml::Pushed tag {0} does not match version v{1}' -f $tag, $version)
+              }
+            }
+            else {
+              $tag = "v$version"
+            }
+            Write-Output "RELEASE_TAG=$tag" >> "$env:GITHUB_OUTPUT"
           }
           else {
             Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload wheels manually!'
             Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+            Write-Output "RELEASE_TAG=" >> "$env:GITHUB_OUTPUT"
           }
 
       # Pin VS build tools to 17.9 for wider compat
@@ -683,14 +766,14 @@ jobs:
           python verify_wheel_metadata.py
 
       - name: Upload wheel files to GitHub release
-        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1' && inputs.target != 'windows_smoke'
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && env.REL == '1' && inputs.target != 'windows_smoke'
         uses: svenstaro/upload-release-action@2.6.1
         with:
           file: ./dist/*.whl
-          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+          tag: ${{ steps.package_version.outputs.RELEASE_TAG }}
           file_glob: true
           overwrite: true
-          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
+          release_name: ${{ steps.package_version.outputs.RELEASE_TAG }}
 
       # Smoke builds never publish; the wheel lands as a workflow artifact instead so it can
       # still be pulled onto a Windows machine for a manual import/functional check
@@ -703,7 +786,7 @@ jobs:
 
   build_sdist:
     name: sdist
-    if: inputs.target == 'all' || inputs.target == 'sdist'
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'sdist'
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -715,13 +798,24 @@ jobs:
         id: package_version
         run: |
           $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
-          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
-            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
-            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+          # Accepts an optional .postN/.devN/.rcN suffix so the fork's 1.5.1.post1 parses whole
+          # and a manual release publishes to the same tag its version implies
+          if ($versionString -match '__version__ = "([0-9]+(?:\.[0-9]+)*(?:\.?(?:post|dev|rc)[0-9]+)?)"') {
+            $version = $Matches[1]
+            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $version)
+            Write-Output "PACKAGE_VERSION=$version" >> "$env:GITHUB_OUTPUT"
+            if ("${{ github.event_name }}" -eq "push") {
+              $tag = "${{ github.ref_name }}"
+            }
+            else {
+              $tag = "v$version"
+            }
+            Write-Output "RELEASE_TAG=$tag" >> "$env:GITHUB_OUTPUT"
           }
           else {
             Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload files manually!'
             Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+            Write-Output "RELEASE_TAG=" >> "$env:GITHUB_OUTPUT"
           }
 
       - name: Install the latest version of uv and set the python version
@@ -743,11 +837,11 @@ jobs:
           python -m build -n
 
       - name: Upload sdist and py3-none-any JIT wheel to GitHub release
-        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && env.REL == '1'
         uses: svenstaro/upload-release-action@2.6.1
         with:
           file: ./dist/*
-          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+          tag: ${{ steps.package_version.outputs.RELEASE_TAG }}
           file_glob: true
           overwrite: true
-          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
+          release_name: ${{ steps.package_version.outputs.RELEASE_TAG }}

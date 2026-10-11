@@ -232,8 +232,7 @@ def routing_dots(bsz, cfg, y, params):
         if activate_all_experts:
             router_logits = torch.matmul(y, cfg.gate_tensor)
             routing_weights = router_logits.sigmoid().float()
-            if cfg.e_score_correction_bias is not None:
-                routing_weights = routing_weights + cfg.e_score_correction_bias.unsqueeze(0).float()
+            # Selection bias only changes which experts are picked; all are active here.
             factor = cfg.routed_scaling_factor / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
             routing_weights = (routing_weights * factor).half()
             selected_experts = (

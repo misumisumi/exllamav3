@@ -10,6 +10,9 @@ from ..modules import Embedding, Linear, GatedResidual
 from ..modules.module import Module
 from ..modules.arch_specific.qwen4_exp_mtp import Qwen4ExpMTPInputLayer
 from ..modules.attn import prepare_for_attn
+from ..ext import exllamav3_ext as ext
+import os as _os
+_MTP_HEAD_N = int(_os.environ.get("EXL3_MTP_HEAD_N", "65536"))
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -174,5 +177,50 @@ class Qwen4ExpMTPModel(Model):
         bsz, seq, _ = state.shape
         stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
-        # The target's head, TP-aware; exports draft confidence when the generator asks
+        if self.attached_model().loaded_tp:
+            # Upstream's unified sampler also exports confidence from TP-sharded heads.
+            return self.attached_model().lm_head_argmax(state, params)
+        ll = self.attached_model().logit_layer_idx
+        lm = self.attached_model().modules[ll]
+        state = lm.prepare_for_device(state, params)
+        # Pruned draft head (EXL3_MTP_HEAD_N): argmax over an EXL3 column slice of the shared
+        # lm_head. Draft-only; verification uses the full head, so outputs are unchanged
+        if _MTP_HEAD_N > 0:
+            ph = self._pruned_head(lm, state.device)
+            if ph is not None:
+                tr, svh, n2 = ph
+                inner = lm.inner
+                b, q, k = state.shape
+                x = state.reshape(b * q, k)
+                if x.dtype != torch.half: x = x.half()
+                x = x.contiguous()
+                xh = torch.empty_like(x)
+                y = torch.empty((b * q, n2), dtype = torch.half, device = x.device)
+                ext.exl3_gemm(x, tr, y, inner.suh, xh, svh, -1, inner.mcg, inner.mul1, 0)
+                if params.get("export_draft_conf"):
+                    # -dds: conf is the raw max logit, identical to the full head's when the
+                    # argmax is in-slice; lower otherwise, so drafting stops earlier
+                    conf, ids = torch.max(y, dim = -1)
+                    params["draft_conf"] = conf.view(b, q)
+                    return ids.view(b, q)
+                return torch.argmax(y, dim = -1).view(b, q)
         return self.attached_model().lm_head_argmax(state, params)
+
+    def _pruned_head(self, lm, device):
+        cached = getattr(self, "_pruned_head_cache", None)
+        if cached is not None:
+            return cached if cached is not False else None
+        inner = getattr(lm, "inner", None)
+        tr = getattr(inner, "trellis", None)
+        if tr is None or getattr(inner, "bias", None) is not None or not hasattr(inner, "svh"):
+            self._pruned_head_cache = False
+            return None
+        n_full = tr.shape[1] * 16
+        n2 = min(_MTP_HEAD_N, n_full, self.attached_model().config.vocab_size) // 128 * 128
+        if n2 <= 0 or n2 >= n_full:
+            self._pruned_head_cache = False
+            return None
+        tr2 = tr[:, :n2 // 16, :].contiguous().to(device)
+        svh2 = inner.svh[:n2].contiguous().to(device)
+        self._pruned_head_cache = (tr2, svh2, n2)
+        return self._pruned_head_cache

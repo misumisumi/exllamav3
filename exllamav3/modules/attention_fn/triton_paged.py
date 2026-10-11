@@ -1150,6 +1150,31 @@ def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, in
     return block_rows, triton.cdiv(rows, block_rows)
 
 
+
+# Historical flash-decoding split counts can be useful when validating an existing
+# model's numerics across the packed-row optimization. Keep the new row packing;
+# restore the occupancy count that selects KV partitions. Changing partitions
+# changes where softmax probabilities are rounded to fp16 before the value dot.
+# BC also retains the original combine kernel's unannotated pointer contract:
+# its fp32 reduction can round differently after an alignment specialization.
+_decode_legacy_splits = os.environ.get("EXL3_ATTN_DECODE_LEGACY_SPLITS", "0") != "0"
+
+
+def decode_split_programs(bsz: int, q_len: int, n_kv_heads: int,
+                          group_size: int, h_blocks: int) -> int:
+    """Occupancy count for selecting decode KV splits, independent of launch rows.
+
+    The opt-in historical count preserves the pre-packed-row split plan on a given
+    device/cache bound. It does not change the actual packed split/combine grid,
+    explicit num_splits overrides, or QSA's sparse selection/gather split plan.
+    """
+    if _decode_legacy_splits:
+        block_m = triton.next_power_of_2(q_len)
+        block_h = max(16 // block_m, 1)
+        h_blocks = triton.cdiv(group_size, block_h)
+    return bsz * n_kv_heads * h_blocks
+
+
 def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
     """(ROWS_SUB, D_SUB) for the combine kernel: the smallest sub-tile whose h32 rotation still
     forms a >= 16-row tl.dot (ROWS_SUB * D_SUB >= 512), D_SUB a multiple of 32."""
@@ -1266,6 +1291,7 @@ def paged_attn_triton_decode(
         max_k_len = min(max_k_len, max_kv_len + kv_append_len)
 
     programs = bsz * n_kv_heads * h_blocks
+    split_programs = decode_split_programs(bsz, q_len, n_kv_heads, group_size, h_blocks)
     dev = q.device.index
     if dev not in _decode_sm_count:
         _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -1275,7 +1301,7 @@ def paged_attn_triton_decode(
         """Split count, partial buffers and the split kernel's argument list for one kv tile."""
         splits = num_splits
         if splits is None:
-            splits = max(1, min(target // programs, triton.cdiv(max_k_len, 1 * block_n), 128))
+            splits = max(1, min(target // split_programs, triton.cdiv(max_k_len, 1 * block_n), 128))
         split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
         if splits > 1:
             partial_o = torch.empty(programs * splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)

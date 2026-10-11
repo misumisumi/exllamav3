@@ -34,6 +34,7 @@
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
 #include "quant/exl3_moe_coop.cuh"
+#include "quant/exl3_moe_coopmk.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -136,6 +137,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
+    m.def("gr_mix_int8", &gr_mix_int8, "gr_mix_int8");
     m.def("gr_mix_tiled", &gr_mix_tiled, "gr_mix_tiled");
     m.def("gr_mix_tiled_slices", &gr_mix_tiled_slices, "gr_mix_tiled_slices");
     m.def("routing_std", &routing_std, "routing_std");
@@ -303,7 +305,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+    m.def("exl3_moe_mixedk", &exl3_moe_mixedk, "exl3_moe_mixedk");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
+
+    // Per-expert runtime-K fused decode MoE for mixed-K layers (exl3_moe_coopmk.cu)
+    py::class_<CoopMK, std::shared_ptr<CoopMK>>(m, "CoopMK")
+        .def(py::init<
+                int,
+                at::Tensor, at::Tensor, at::Tensor,
+                at::Tensor, at::Tensor, at::Tensor,
+                at::Tensor, at::Tensor, at::Tensor,
+                c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>,
+                at::Tensor, at::Tensor, at::Tensor,
+                bool, bool, int, float, bool,
+                at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                at::Tensor, at::Tensor,
+                c10::optional<at::Tensor>,
+                int, int, int>(),
+             py::arg("Hi"),
+             py::arg("g_trellis"), py::arg("g_suh"), py::arg("g_svh"),
+             py::arg("u_trellis"), py::arg("u_suh"), py::arg("u_svh"),
+             py::arg("d_trellis"), py::arg("d_suh"), py::arg("d_svh"),
+             py::arg("g_bias"), py::arg("u_bias"), py::arg("d_bias"),
+             py::arg("k_gate"), py::arg("k_up"), py::arg("k_down"),
+             py::arg("mcg"), py::arg("mul1"), py::arg("act"), py::arg("act_limit"), py::arg("gated"),
+             py::arg("had_g"), py::arg("had_u"), py::arg("gu_g"), py::arg("gu_u"), py::arg("act_out"), py::arg("d_out"),
+             py::arg("ctr"), py::arg("out"),
+             py::arg("sh_gate_w"),
+             py::arg("min_expert"), py::arg("max_expert"), py::arg("plan") = 0)
+        .def("run", &CoopMK::run,
+             py::arg("x"), py::arg("sel"), py::arg("rw"), py::arg("sh_out") = py::none(),
+             py::arg("wide_a") = -1, py::arg("wide_b") = -1, py::arg("plan") = -1)
+        .def("stage_variants", &CoopMK::stage_variants, py::arg("stage"), py::arg("plan") = -1)
+        .def_readonly("kset_a", &CoopMK::kset_a)
+        .def_readonly("kset_b", &CoopMK::kset_b)
+        .def_readwrite("plan", &CoopMK::plan);
+    m.def("coopmk_kernel_info", &coopmk_kernel_info, py::arg("Hi"));
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");

@@ -112,6 +112,21 @@ On ROCm both kernels run on RDNA's int8 WMMA instructions (`rocm/det_gemm_rocm.c
 per-chunk integer sums are exact and the fp32 combination keeps the same fixed order, so ranks
 agree across RDNA generations as well.
 
+### `EXL3_GR_INT8` (fork default: `1`)
+
+Use the fork's derived int8 gated-residual projection tables for decode-sized
+mixes (up to eight rows) on supported CUDA shapes. This preserves the established
+GB10 decode path. It quantizes the norm-folded projection and repacked up table;
+this is a numerical approximation, so compare model logits and task quality when
+changing it. Set to `0` to use upstream's fp16 decode representation.
+
+Both settings retain upstream's **unfolded fp16** tables for deterministic tiled
+prefill. The int8 decode copies are additional resident memory, and never replace
+or fold the tables used by prefill. The weighted-stream handoff between adjacent
+sites is used only when the receiving site takes the fp16 decode path. Targeted
+merge checks are in `tests/test_spark_merge_gpu.py`; run the upstream fp16 parity
+tests with `EXL3_GR_INT8=0`.
+
 ### `EXL3_BC_GDN` (default: `1`)
 
 Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL3_BC_ATTN`:
@@ -350,6 +365,33 @@ token id rather than sorted position, so individual seeds map to different sampl
 same distribution. Stacks the collapse does not recognize fall back to the step-by-step path by
 design. Set to `0` to disable collapsing entirely, e.g. for A/B validation against the
 reference implementation.
+
+## MTP drafting
+
+### `EXL3_DRAFT_ROW_BUDGET` (default: `0`, disabled)
+
+Experimental cap for multi-sequence MTP verification work. The generator limits the
+proposal window to `min(num_draft_tokens, max(0, budget // batch_size - 1))` when
+more than one sequence is decoding. Single-sequence drafting keeps its configured
+window; confidence-based early stopping can shorten either window further.
+A `Generator(draft_row_budget=...)` argument overrides the environment variable.
+Use a nonnegative integer; invalid values raise an error at generator creation.
+
+For a configured window of five, a budget of eight proposes five tokens at batch
+one, three at batch two, one at batch four, and zero at batch eight. The budget is
+a tuning target, not a limit on batch size: the target model must still verify
+one row per active sequence if the batch itself is wider than the budget.
+
+A zero-proposal round still writes the current MTP cache position with an
+unsampled prefill. This is necessary when a wide batch later shrinks and resumes
+drafting; skipping that write would leave holes in the draft cache. Draft-head
+evaluation and sampling are skipped for that round. Full native draft headroom
+remains reserved for page allocation, because batch size may change at any step.
+
+Adapted from the row-budget proposal in fork PR #18, with the cache-continuity
+fix tested in `tests/test_mtp_row_budget_cpu.py`. This switch stays off until an
+actual concurrent workload shows a throughput or latency improvement. Measure
+accepted tokens per target pass as well as total tokens per second.
 
 ## CPU MoE offload
 

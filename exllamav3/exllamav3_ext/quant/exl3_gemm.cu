@@ -13,6 +13,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemv.cuh"
 #include "exl3_gemv_int8.cuh"
 #include "coop_autotune.cuh"
+#include "exl3_gemm_policy.h"
 #if defined(USE_ROCM)
     #include "../rocm/quant/exl3_mgemv_rdna.cuh"
     #include "../rocm/quant/exl3_gemv_multirow_rdna.cuh"
@@ -75,8 +76,11 @@ uint64_t gemm_autotune_hash
         h *= 1099511628211ull;
     };
     mix((uint64_t) (half_k ? 1 : 0));
-    // Past 16 rows, buckets follow the multi-row tile heights so each is tuned separately
-    mix((uint64_t) (size_m <= 16 ? roundup_pow2(size_m) : MIN(CEIL_DIVIDE(size_m, 16) * 16, 64)));
+    // The legacy CUDA policy reuses the historical <=16-row cache key and
+    // candidate set together, preserving the cached shape and SM split plan.
+    // Otherwise each wider row tile retains its own autotuning bucket.
+    mix((uint64_t) (exl3_gemm_legacy_tiles_enabled() ? MIN(roundup_pow2(size_m), 16)
+        : (size_m <= 16 ? roundup_pow2(size_m) : MIN(CEIL_DIVIDE(size_m, 16) * 16, 64))));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
     mix((uint64_t) K);
@@ -322,7 +326,7 @@ int exl3_gemm_gr
             return tuned.tag;
         }
         std::vector<CoopAutotuneCandidate> candidates;
-        for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
+        for (int candidate_shape_idx = 1; candidate_shape_idx <= exl3_gemm_autotune_shape_count(EXL3_GEMM_NUM_SHAPES); ++candidate_shape_idx)
         {
             if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K, half_k)) continue;
 
@@ -764,7 +768,7 @@ int exl3_mgemm_gr
         if (!graph)
         {
             std::vector<CoopAutotuneCandidate> candidates;
-            for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
+            for (int candidate_shape_idx = 1; candidate_shape_idx <= exl3_gemm_autotune_shape_count(EXL3_GEMM_NUM_SHAPES); ++candidate_shape_idx)
             {
                 if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K, half_k)) continue;
 

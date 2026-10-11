@@ -141,6 +141,9 @@ class AsyncJob:
     """
     Async wrapper for dynamic generator job. See definition of Job.
     """
+    # Distinguish natural-only observation from older finite-budget implementations.
+    supports_natural_token_budget = True
+
     def __init__(self, generator: AsyncGenerator, *args: object, **kwargs: object):
         self.generator = generator
         self.job = Job(*args, **kwargs)
@@ -181,6 +184,28 @@ class AsyncJob:
         shared iteration task but still queued for this consumer precede the injection in the stream.
         """
         self.job.constrain_output_now(output)
+
+    def set_token_budget(
+        self, max_tokens: int | None, output: str | torch.Tensor | None = None, *,
+        end_token_id: int, on_end = None, can_end = None,
+    ):
+        """
+        Bound or observe an already-active phase; see Job.set_token_budget.
+        max_tokens=None observes natural closure without imposing a token deadline.
+
+        Configure synchronously after AsyncJob construction and before the first await to count
+        from the first generated token. The optional synchronous on_end receives the underlying
+        Job and runs on the producer before another sample, independent of consumer backpressure.
+        """
+        self.job.set_token_budget(
+            max_tokens, output, end_token_id = end_token_id, on_end = on_end, can_end = can_end,
+        )
+
+    def clear_token_budget(self):
+        """
+        Disarm the phase budget without changing an already scheduled forced tail.
+        """
+        self.job.clear_token_budget()
 
     def set_sampler(self, sampler):
         """

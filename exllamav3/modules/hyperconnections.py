@@ -11,6 +11,10 @@ from ..util.tensor import g_tensor_cache
 import os
 import math
 
+# GB10 decode stores a folded projection and the up table in int8. Upstream's resident fp16
+# tables are retained for deterministic tiled prefill; only decode uses these derived copies.
+_GR_INT8 = os.environ.get("EXL3_GR_INT8", "1") != "0"
+
 # Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
@@ -366,6 +370,7 @@ class GatedResidual(Module):
         self.inject_h = None        # (hc_mult, hc_mult * hidden) half (site form)
         self.proj_h = None          # cat(down, inject) half, zero-padded to a multiple of 64
                                     # rows for the tiled path (other paths use [:proj_m])
+        self.fn_q = self.fn_s = self.upx_q = self.upx_s = None
         self.proj_m = 0             # rows of proj_h in use: rank (+ hc_mult in the site form)
         self.rank = 0
         self.tiled = False          # prefill mixes take the tiled deterministic kernel
@@ -422,16 +427,42 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
+        self.fn_q = self.fn_s = self.upx_q = self.upx_s = None
+        if _GR_INT8 and dev.type == "cuda" and H == 4 and Dh % 8 == 0:
+            self._quantize_int8(H, Dh)
         if self.tiled and not keep_source_weights:
             # Every inference consumer reads proj_h directly or the repacked up (the tiled path
             # derives its int8 tables per call, _tiled_tables): release the checkpoint-layout up
             self.up_h = None
+
+    def _quantize_int8(self, H: int, Dh: int):
+        """Derived int8 decode tables, preserving upstream's fp16 prefill tables.
+
+        The historical GB10 kernel consumes raw streams and a projection with hc_norm folded
+        into it. Upstream 1.6 stores an unfolded projection and weights the streams instead.
+        Reproduce the old fp16 fold before quantizing so the decode representation stays the
+        same; never replace proj_h/upx_h, since tiled prefill reconstructs its hi/lo tables
+        from those on each call.
+        """
+        qmax = 127.0
+        # The old preparation folds w_h, whose norm coefficients were already
+        # rounded to fp16. Using norm_w (fp32) here changes the quantized bytes
+        # near rounding thresholds and can accumulate across the 97 GR sites.
+        f = (self.proj_h[:self.proj_m].float() * self.w_h.float()).half().float()
+        fs = f.abs().amax(dim = 1).clamp_min(1e-8) / qmax
+        self.fn_q = torch.round(f / fs[:, None]).clamp_(-128, 127).to(torch.int8).contiguous()
+        self.fn_s = fs.contiguous()
+        u = self.upx_h.float()
+        us = u.abs().amax(dim = 2).clamp_min(1e-8) / qmax
+        self.upx_q = torch.round(u / us[:, :, None, :]).clamp_(-128, 127).to(torch.int8).contiguous()
+        self.upx_s = us.reshape(H, Dh).contiguous()
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = None
+        self.fn_q = self.fn_s = self.upx_q = self.upx_s = None
 
     @override
     def get_tensors(self):
@@ -559,7 +590,12 @@ class GatedResidual(Module):
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+            if self.fn_q is not None:
+                ext.gr_mix_int8(s3, self.fn_q, self.fn_s, self.upx_q, self.upx_s, self.w_h,
+                                self.rms_eps, dots, post, mixed)
+            else:
+                ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h,
+                           self.rms_eps, dots, post, mixed)
         elif self.tiled:
             # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
             # reuses segments across chunk sizes), never statics
@@ -629,7 +665,8 @@ class GatedResidual(Module):
         # the device: the copy is consumed by the very next mix on the stream.
         nxt = self.next_site
         xw = None
-        if nxt is not None and R <= self.FUSED_MAX_R and nxt.w_h is not None and nxt.w_h.device == x.device:
+        if (nxt is not None and R <= self.FUSED_MAX_R and nxt.fn_q is None
+                and nxt.w_h is not None and nxt.w_h.device == x.device):
             xw = g_tensor_cache.get_bucketed(x.device, x3.numel(), torch.float, "gr_apply_xw").view(x3.shape)
         ext.hc_apply(
             x3,

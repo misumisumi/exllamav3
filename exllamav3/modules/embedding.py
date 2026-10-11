@@ -20,6 +20,10 @@ Token embedding table. Three storage forms, all behind the same lookup:
                                       decoded on the device
 """
 
+import os as _os
+_EMBED_GPU = _os.environ.get("EXL3_EMBED_GPU", "1") != "0"
+_EMBED_GPU_MAX_MB = int(_os.environ.get("EXL3_EMBED_GPU_MAX_MB", "4096"))
+
 DEDUP_MIN_TOKENS = 16
 
 class TableEmbedding:
@@ -84,6 +88,8 @@ class Embedding(Module):
 
         self.key = key
         self.embedding = None
+        self._gpu_mirror = None
+        self._gpu_mirror_dev = None
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.out_dtype = out_dtype
@@ -109,6 +115,8 @@ class Embedding(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
+        self._gpu_mirror = None
+        self._gpu_mirror_dev = None
         stc = self.config.stc
         table = RowTable.find(stc, self.key, "trellis") if self.allow_table else None
         infer_params = getattr(self.config, "infer_params", None)
@@ -136,6 +144,8 @@ class Embedding(Module):
             self.embedding.table.close()
         self.device = None
         self.embedding = None
+        self._gpu_mirror = None
+        self._gpu_mirror_dev = None
 
     @override
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
@@ -251,6 +261,20 @@ class Embedding(Module):
         else:
             if isinstance(self.embedding, TableEmbedding):
                 x = self.embedding.forward(x, bool(params.get("pinned_staging")))
+            elif x.device.type == "cuda" and self.device is not None and self.device.type == "cpu":
+                # Device-resident MTP token IDs avoid a host synchronization against a resident
+                # CPU embedding. Streamed/quantized tables retain RowTable's lookup path.
+                if self._gpu_mirror is None or self._gpu_mirror_dev != x.device:
+                    self._gpu_mirror = None
+                    if _EMBED_GPU:
+                        w = self.embedding.weight.data
+                        if w.numel() * w.element_size() <= _EMBED_GPU_MAX_MB << 20:
+                            self._gpu_mirror = w.to(x.device, non_blocking = False)
+                            self._gpu_mirror_dev = x.device
+                if self._gpu_mirror is not None:
+                    x = torch.nn.functional.embedding(x, self._gpu_mirror)
+                else:
+                    x = self.embedding.forward(x.cpu())
             else:
                 x = self.embedding.forward(x)
             if self.multiplier != 1.0:

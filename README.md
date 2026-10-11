@@ -3,7 +3,7 @@
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
-[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
+[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Multi-node](#multi-node-inference) · [Quantization](#exl3-quantization) · [Community](#community)
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
@@ -31,6 +31,37 @@ Pick a wheel from the [releases page](https://github.com/turboderp-org/exllamav3
 ```sh
 pip install https://github.com/turboderp-org/exllamav3/releases/download/v0.0.6/exllamav3-0.0.6+cu128.torch2.8.0-cp313-cp313-linux_x86_64.whl
 ```
+
+### Prebuilt wheels from this fork
+
+This fork publishes wheels for every release tag on its own [releases page](https://github.com/vcruz305/exllamav3/releases) - no CUDA toolkit, compiler or arch list on your side. Assets are named
+
+```
+exllamav3-<version>+cu<CUDA>.torch<torch>-cp<py>-cp<py>-<platform>.whl
+```
+
+so `exllamav3-1.5.1.post1+cu128.torch2.11.0-cp312-cp312-linux_x86_64.whl` is the CUDA 12.8 build for Python 3.12 with torch 2.11.0, and the same row on Windows ends in `win_amd64`. Pick the row matching the `torch`/CUDA pair you want; the wheel requires that exact `torch` version (see the caveat below).
+
+Linux/macOS:
+
+```sh
+pip install https://github.com/vcruz305/exllamav3/releases/download/v1.5.1.post1/exllamav3-1.5.1.post1+cu128.torch2.11.0-cp312-cp312-linux_x86_64.whl
+```
+
+Windows (quote the URL - PowerShell treats `+` and `&` specially):
+
+```powershell
+pip install "https://github.com/vcruz305/exllamav3/releases/download/v1.5.1.post1/exllamav3-1.5.1.post1+cu128.torch2.11.0-cp312-cp312-win_amd64.whl"
+```
+
+Rows built per release: Python 3.10-3.14 x torch 2.8.0-2.13.0 x CUDA 12.8 (`cu128`) and 13.2 (`cu132`), for Linux and Windows. Not every cell exists - torch 2.12/2.13 only ship on the CUDA 13.2 row, and torch 2.11 has no Python 3.10/3.11 wheels - so the release page is the list of what is actually available.
+
+- **No local build, no arch guessing.** Every wheel carries the fat CUDA arch list `8.0 8.6 8.9 9.0 10.0 12.0+PTX`: Ampere through Blackwell, including `sm_120` natively and newer parts such as GB10 (`sm_121`) through the `12.0+PTX` JIT entry. At runtime a wheel only needs a CUDA *driver*; the toolkit it was built against does not have to be installed locally.
+- **Nightly channel.** The rolling pre-release tagged [`nightly`](https://github.com/vcruz305/exllamav3/releases/tag/nightly) holds one Linux/CUDA 12.8 wheel built from the tip of `master`, with the same fat arch list. Its single asset is replaced on every push, so install from the URL rather than a saved copy:
+  ```sh
+  pip install --force-reinstall https://github.com/vcruz305/exllamav3/releases/download/nightly/exllamav3-1.5.1.post1+cu128.torch2.11.0-cp312-cp312-linux_x86_64.whl
+  ```
+- **Caveat - the package name is `exllamav3`.** These wheels are not a separate distribution, so installing one *replaces* an upstream `exllamav3` (PyPI or source) install in that environment instead of sitting next to it. Each wheel also pins its exact `torch` version as a requirement, so pip will install or downgrade `torch` to match it; to keep the torch you already have, install torch first and then the wheel with `--no-deps`. A virtualenv per fork build is the simple way to avoid surprises.
 
 ### Install from PyPI
 
@@ -181,6 +212,25 @@ python examples/chat.py -m <input_dir> -mode <prompt_mode>
 python examples/chat.py -h
 ```
 
+## Multi-node inference
+
+[`examples/multinode_pipeline.py`](examples/multinode_pipeline.py) runs **sequential
+layer-split pipeline parallelism (PP)** across hosts, with TCP (`NetEndpoint`) or
+`torch.distributed` point-to-point transport (`NcclEndpoint`, NCCL/RoCE on CUDA).
+Each rank loads only its assigned layers. This is not the library's single-host
+TP worker system, an overlapped pipeline scheduler, or a packaged cross-host TP/CP
+server. The four-Spark GLM work recovered pinned-buffer lifetime fixes, byte-safe
+TCP staging, NCCL p2p, DSA-safe layer splits and the sm_121 cooperative mixed-K
+decode default; these are included here.
+
+See the [multi-node guide](doc/multinode.md) for build/runtime identity, generic
+four-rank launch commands, memory and precision rules, historical short-context
+validation, and what remains outside this PR. Read the
+[transport and driver limits](doc/multinode_pipeline_limits.md) before deployment:
+trusted fabric only, finite frame/I/O budgets, numeric fabric IPs for hard TCP
+connect deadlines, and automatic recurrent-state handling for GLM-5.3-Flash. Other
+recurrent/hybrid families remain fail-closed in the manual PP loop.
+
 ## Architecture support
 
 | Model family                                     | HF architecture | Multimodal | Notes |
@@ -236,6 +286,10 @@ python examples/chat.py -h
 | **Step 3.7 Flash**                               | `Step3p7ForConditionalGeneration` | ✓ |  |
 
 Always adding more, stay tuned.
+
+For the **K2-Horizon MoVA 6.50bpw** checkpoint at its pinned revision, see the
+[missing routing-bias recovery guide](doc/k2-horizon-bias-overlay.md). This is
+not a blanket claim of support for other K2 quant revisions.
 
 ## Conversion
 

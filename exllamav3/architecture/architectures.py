@@ -29,6 +29,7 @@ from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
 from .kimi_linear import KimiLinearModel
+from .k2_horizon import K2HorizonModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
@@ -61,6 +62,7 @@ from .solar_open_moe import SolarOpenMoeModel
 from .spark2_5 import Spark2_5Model
 from .step3_5 import Step3_5Model
 from .step3_7 import Step3_7Model
+from .step5_robotics import Step5RoboticsModel
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -96,6 +98,7 @@ ARCHITECTURES = {
         GlmMoeDsaModel,
         Glm5NextModel,
         KimiLinearModel,
+        K2HorizonModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
@@ -136,6 +139,7 @@ ARCHITECTURES = {
         Spark2_5Model,
         Step3_5Model,
         Step3_7Model,
+        Step5RoboticsModel,
     ]
 }
 
