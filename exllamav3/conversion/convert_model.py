@@ -966,13 +966,16 @@ def run_calib_chunks(rows, bad_rows, get_preserve, one, batch, allow = True):
             if len(chunk) == 1:
                 one(chunk[0])
                 continue
+            retry = False
             try:
                 batch(chunk)
             except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
                 batch_limit = max(1, len(chunk) // 2)
                 middle = len(chunk) // 2
                 pending[0:0] = [chunk[:middle], chunk[middle:]]
+                retry = True
+            if retry:
+                torch.cuda.empty_cache()
 
 
 def batch_input_ids(original_input_ids, chunk):
