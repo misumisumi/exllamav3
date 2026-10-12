@@ -57,6 +57,14 @@ does.
 
 - **-dr / --device_ratios *list***: Ratio as comma-separated list. Determines how the encoding workload is distributed when using multiple devices. This is useful if using GPUs with dissimilar compute performance, to prevent slower GPUs from becoming bottlenecks. Ratios are relative, i.e. `1,1,3` is the same ratio as `3,3,9`. Recommendation is to omit this argument; by default, ratios are autotuned to maximize usage across GPUs.
 
+- **-cbs / --calib_batch_rows *N|auto***: Calibration rows per forward during capture and state advance. Default `auto` selects 32, capped at the calibration row count. Batched forwards automatically retry the same rows with half-sized batches after CUDA out-of-memory, down to one row.
+
+- **-cdn / --calib_devices *N|auto***: Calibration forward devices. Default `auto` uses one of the selected `-d` devices when the effective batch is larger than one, otherwise all selected devices. An integer selects the first N devices; `0` selects all. Quantization always uses all devices specified by `-d`.
+
+- **Restore old calibration behavior**: use `-cbs 1 -cdn 0`. Both options are momentary and may be changed when resuming with `-r`; they are not stored in `args.json`.
+
+- **Measured conversion speed**: On one Qwen3.5 35B-A3B MoE layer (256 experts, 256 calibration rows), capture took 114 s on the previous 2-device path, 36 s on the previous 1-device path, 27 s with `-cbs 16` on 2 devices, 21 s with `-cbs 16 -cdn 1`, and 16 s with `-cbs 32 -cdn 1`. On an 8x B300, 512-row run, capture per layer changed from 330 s to 23 s and total per-layer time from about 520 s to 219 s. An embedding/layer-0 A/B (64 rows, same recipe, `-sh -v -cb mul1`) compared 846 tensors: median proxy relative difference 0 at printed precision; mean proxy 1.02814e-4 vs 1.02826e-4; RFN 0.019624 vs 0.019572 and SQNR 36.380 vs 36.389. Differences were due to fp32 summation order.
+
 - **-pm / --parallel_mode**: Deprecated (no-op). Parallel mode is now the default: multi-GPU quantization distributes one linear layer to each GPU at a time whenever a layer has at least as many tensors as there are devices. Layers with fewer tensors than devices (e.g. the lm_head, alone in its layer) fall back to splitting the trellis encoding workload across devices, with small tensors capped to as many devices as they can feed (~1M weights per device).
 
 #### Debug stuff (ignore these)

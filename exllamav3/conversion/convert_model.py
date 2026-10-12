@@ -92,8 +92,8 @@ parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mo
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
-parser.add_argument("-cdn", "--calib_devices", type = int, default = 0, help = "Use only the first N --devices for calibration forwards (capture/state advance); quantization still uses all. Momentary, resume-safe. Default: all")
-parser.add_argument("-cbs", "--calib_batch_rows", type = int, default = 1, help = "Calibration rows per forward pass in capture/state advance (momentary, resume-safe), default: 1")
+parser.add_argument("-cdn", "--calib_devices", type = str, default = "auto", help = "Calibration forward devices: auto (one when batching, otherwise all), or first N --devices; quantization still uses all. Momentary, resume-safe")
+parser.add_argument("-cbs", "--calib_batch_rows", type = str, default = "auto", help = "Calibration rows per forward: auto (32, capped at calibration rows), or a positive integer. Momentary, resume-safe")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
 parser.add_argument("-hess", "--hessians", type = str, default = None, help = "Directory of precomputed per-tensor Hessians (<key>.safetensors with hin (in, in) and/or hout (out, out), square or packed upper triangle, and/or hout_diag, e.g. YAQA-style Kronecker factors from a separate gradient pass, see util/yaqa_hessians.py). Tensors with hin skip the calibration forward passes; tensors with hout use two-sided LDLQ")
 parser.add_argument("-h1", "--hessians_one_sided", action = "store_true", help = "With --hessians: keep the regular one-sided LDLQ for tensors that have hout, leaving the output side to --out_scales yaqa")
@@ -230,6 +230,8 @@ def prepare(args) -> (dict, dict, bool, str):
     in_args = { "work_dir": args.work_dir }
     if args.resume:
         in_args = load_dict("args.json", in_args)
+        in_args.pop("calib_batch_rows", None)
+        in_args.pop("calib_devices", None)
         in_args["work_dir"] = args.work_dir
 
     prepare_env(in_args)
@@ -315,8 +317,18 @@ def prepare(args) -> (dict, dict, bool, str):
     if in_args["hessians_one_sided"] and not in_args["hessians"]:
         return None, None, False, "--hessians_one_sided needs --hessians"
     in_args["max_module"] = args.max_module
-    in_args["calib_batch_rows"] = max(1, int(args.calib_batch_rows or 1))
-    in_args["calib_devices"] = max(0, int(args.calib_devices or 0))
+    try:
+        in_args["calib_batch_rows"] = min(32, max(1, int(args.cal_rows or 250))) if args.calib_batch_rows == "auto" else int(args.calib_batch_rows)
+        if in_args["calib_batch_rows"] < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        return None, None, False, "--calib_batch_rows must be 'auto' or a positive integer"
+    try:
+        in_args["calib_devices"] = (1 if in_args["calib_batch_rows"] > 1 else 0) if args.calib_devices == "auto" else int(args.calib_devices)
+        if in_args["calib_devices"] < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return None, None, False, "--calib_devices must be 'auto' or a non-negative integer"
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
@@ -327,7 +339,7 @@ def prepare(args) -> (dict, dict, bool, str):
             "next_module_idx": 0,
             "q_strategy": None,
         }
-        save_dict("args.json", in_args, in_args)
+        save_dict("args.json", {k: v for k, v in in_args.items() if k not in {"calib_batch_rows", "calib_devices"}}, in_args)
         save_dict("ckpt/job.json", job_state, in_args)
 
     warn_experimental = False
@@ -942,6 +954,27 @@ def calib_chunks(rows, bad_rows, get_preserve, allow = True):
             yield "batch", chunk
 
 
+def run_calib_chunks(rows, bad_rows, get_preserve, one, batch, allow = True):
+    batch_limit = CALIB_BATCH if allow else 1
+    for kind, item in calib_chunks(rows, bad_rows, get_preserve, allow):
+        if kind == "one":
+            one(item)
+            continue
+        pending = [item[i:i + batch_limit] for i in range(0, len(item), batch_limit)]
+        while pending:
+            chunk = pending.pop(0)
+            if len(chunk) == 1:
+                one(chunk[0])
+                continue
+            try:
+                batch(chunk)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                batch_limit = max(1, len(chunk) // 2)
+                middle = len(chunk) // 2
+                pending[0:0] = [chunk[:middle], chunk[middle:]]
+
+
 def batch_input_ids(original_input_ids, chunk):
     ids = [original_input_ids[i] for i in chunk]
     return torch.stack(ids, 0) if ids[0].dim() == 1 else torch.cat(ids, 0)
@@ -1039,10 +1072,12 @@ def capture_module_parallel(
 
             def batch(chunk):
                 nonlocal done_rows
+                attempt_capture = {}
+                attempt_sens = {}
                 params = {
                     "attn_mode": "flash_attn_nc",
-                    "capture": captures[t_idx],
-                    "capture_sens": captures_sens[t_idx],
+                    "capture": attempt_capture,
+                    "capture_sens": attempt_sens,
                     "activate_all_experts": model.calibration_all_experts,
                     "input_ids": batch_input_ids(original_input_ids, chunk),
                     "quant_preserve": {},
@@ -1053,16 +1088,22 @@ def capture_module_parallel(
                 rs = module.forward(rs, params)
                 if params["quant_preserve"]:
                     raise RuntimeError("--calib_batch_rows: module uses quant_preserve, not batchable")
+                for qmap, hd in attempt_capture.items():
+                    if qmap not in captures[t_idx]:
+                        captures[t_idx][qmap] = hd
+                    else:
+                        accumulated = captures[t_idx][qmap]
+                        accumulated["H"] += hd["H"]
+                        accumulated["count"] += hd["count"]
+                        accumulated["num_total"] += hd["num_total"]
+                        accumulated["inf_nan"] += hd["inf_nan"]
+                merge_out_sensitivity(captures_sens[t_idx], attempt_sens)
                 rs = None
                 done_rows += len(chunk)
                 with lock:
                     progress_count[0] += len(chunk)
 
-            for kind, item in calib_chunks(shards[t_idx], bad_rows, get_preserve):
-                if kind == "one":
-                    one(item)
-                else:
-                    batch(item)
+            run_calib_chunks(shards[t_idx], bad_rows, get_preserve, one, batch)
             torch.cuda.synchronize(torch.device(devices[t_idx]))
             auto_split.report("calib", devices[t_idx], done_rows, time.time() - t0)
         return worker
@@ -1186,11 +1227,7 @@ def advance_state_parallel(
                 with lock:
                     progress_count[0] += len(chunk)
 
-            for kind, item in calib_chunks(shards[t_idx], bad_rows, get_preserve, allow = not is_last_module):
-                if kind == "one":
-                    one(item)
-                else:
-                    batch(item)
+            run_calib_chunks(shards[t_idx], bad_rows, get_preserve, one, batch, allow = not is_last_module)
             torch.cuda.synchronize(torch.device(devices[t_idx]))
             auto_split.report("calib", devices[t_idx], done_rows, time.time() - t0)
         return worker
@@ -1277,8 +1314,7 @@ def main(args, job_state):
     global max_progress, curr_progress, timed_blocks
     global CALIB_BATCH
     CALIB_BATCH = int(args.get("calib_batch_rows", 1) or 1)
-    if CALIB_BATCH > 1:
-        print(f" -- Calibration forwards batch {CALIB_BATCH} rows")
+    print(f" -- Calibration forwards batch {CALIB_BATCH} rows; devices {args.get('calib_devices', 0) or 'all'}")
 
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 

@@ -310,6 +310,26 @@ The working directory is temporary storage for state checkpoints and for storing
 until the converted model can be compiled. It should have enough free space to store an entire copy 
 of the output model.
 
+### Conversion speed / multi-GPU
+
+Calibration forwards default to `-cbs auto` (32 rows per forward, capped by the calibration row count) and `-cdn auto` (one calibration device when batching; otherwise all selected devices). An out-of-memory error on a batched forward releases cached CUDA memory, halves that worker's batch, and retries the same rows, down to the original one-row path. Quantization continues to use every device supplied with `-d`.
+
+Set `-cbs N` to choose the calibration rows per forward and `-cdn N` to use the first N devices for calibration. These settings are momentary and may be changed on `-r` resume. Restore the pre-batching behavior with `-cbs 1 -cdn 0`.
+
+Measured on one MoE layer of Qwen3.5 35B-A3B, 256 experts, 256 calibration rows:
+
+| Configuration | Capture time |
+| --- | ---: |
+| Previous path, 2 devices | 114 s |
+| Previous path, 1 device | 36 s |
+| `-cbs 16`, 2 devices | 27 s |
+| `-cbs 16 -cdn 1` | 21 s |
+| `-cbs 32 -cdn 1` | 16 s |
+
+On the measured 8x B300, 512-row run, capture per layer changed from 330 s to 23 s; total per-layer time changed from about 520 s to 219 s. These are measurements from the fork before this defaults change. An A/B comparison on embedding and layer 0 (64 rows, same recipe, `-sh -v -cb mul1`) compared 846 tensors: median per-tensor proxy relative difference was 0 at printed precision; mean proxy was 1.02814e-4 vs 1.02826e-4, and layer RFN/SQNR were 0.019624/36.380 vs 0.019572/36.389. Differences were from fp32 summation order.
+
+Both options are resume-safe and are not written to `args.json`.
+
 See the [conversion guide](doc/convert.md) for more information, or the 
 [self-calibration guide](doc/optimize.md). 
 

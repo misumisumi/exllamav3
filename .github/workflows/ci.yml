@@ -116,4 +116,5 @@ jobs:
             tests/test_uma_budget_cpu.py \
             tests/test_dflash_page_reserve_cpu.py \
             tests/test_sampler_batch_verify_cpu.py \
-            tests/test_token_budget_cpu.py
+            tests/test_token_budget_cpu.py \
+            tests/conversion/test_calibration_batching_cpu.py
