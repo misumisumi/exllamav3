@@ -217,7 +217,7 @@ def make_job(**kwargs):
     kwargs.setdefault("input_ids", torch.tensor([[7, 1]]))
     kwargs.setdefault("max_new_tokens", 100)
     job = Job(**kwargs)
-    generator = NS(tokenizer=Tokenizer(), draft_model=None, ngram_match_min=0,
+    generator = NS(tokenizer=Tokenizer(), draft_model=None, ngram_match_min=0, hybrid_draft_tokens=0,
                    recurrent_cache=None, padded_vocab_size=VOCAB)
     _attach(job, generator)
     return job
@@ -804,6 +804,7 @@ class SyncGenerator:
         self.width = width
         self.draft_model = None
         self.ngram_match_min = 0
+        self.hybrid_draft_tokens = 0
         self.recurrent_cache = None
         self.padded_vocab_size = VOCAB
         self.drained = 0

@@ -99,9 +99,9 @@ jobs:
         # tensors on the CPU and are green on master; they include the half-bit ABI guard for
         # the mixed-K MoE path (test_mixedk_merge_abi), which re-reads block_sparse_mlp.py.
         run: |
-          python -m pytest -q \
+          python -m pytest --noconftest -q \
             tests/test_mixedk_merge_abi.py \
-            tests/test_optimizer_targets.py \
+            tests/conversion/test_optimizer_targets.py \
             tests/test_draft_confidence_env_.py \
             tests/test_attn_fullgate_cpu.py
 
