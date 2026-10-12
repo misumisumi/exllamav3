@@ -92,6 +92,8 @@ parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mo
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
+parser.add_argument("-cdn", "--calib_devices", type = int, default = 0, help = "Use only the first N --devices for calibration forwards (capture/state advance); quantization still uses all. Momentary, resume-safe. Default: all")
+parser.add_argument("-cbs", "--calib_batch_rows", type = int, default = 1, help = "Calibration rows per forward pass in capture/state advance (momentary, resume-safe), default: 1")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
 parser.add_argument("-hess", "--hessians", type = str, default = None, help = "Directory of precomputed per-tensor Hessians (<key>.safetensors with hin (in, in) and/or hout (out, out), square or packed upper triangle, and/or hout_diag, e.g. YAQA-style Kronecker factors from a separate gradient pass, see util/yaqa_hessians.py). Tensors with hin skip the calibration forward passes; tensors with hout use two-sided LDLQ")
 parser.add_argument("-h1", "--hessians_one_sided", action = "store_true", help = "With --hessians: keep the regular one-sided LDLQ for tensors that have hout, leaving the output side to --out_scales yaqa")
@@ -313,6 +315,8 @@ def prepare(args) -> (dict, dict, bool, str):
     if in_args["hessians_one_sided"] and not in_args["hessians"]:
         return None, None, False, "--hessians_one_sided needs --hessians"
     in_args["max_module"] = args.max_module
+    in_args["calib_batch_rows"] = max(1, int(args.calib_batch_rows or 1))
+    in_args["calib_devices"] = max(0, int(args.calib_devices or 0))
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
@@ -841,7 +845,7 @@ def load_parallel_calib_modules(replica_models, idx, devices, load_slice, source
     Load replicas of module idx onto secondary devices for parallel calibration passes. Returns the list of
     replica modules, or None if replication is unavailable (caller falls back to the serial path).
     """
-    if not replica_models:
+    if not replica_models and len(devices) > 1:
         return None
     replicas = []
     try:
@@ -902,6 +906,60 @@ def run_row_workers(title, num_rows, workers, progress_count):
         raise errors[0]
 
 
+
+# Row batching for the calibration forwards (--calib_batch_rows). Rows are independent sequences of equal
+# length, so stacking them along the batch dim gives the same per-row outputs, and the Hessian proxy is a
+# plain sum over tokens (only fp32 summation order differs). Reference rows, rows already excluded, and rows
+# carrying quant_preserve state keep the original one-row path.
+CALIB_BATCH = 1
+
+
+def _row_batchable(i, bad_rows, get_preserve):
+    if i < num_ref_states or i in bad_rows:
+        return False
+    p = {}
+    get_preserve(i, p)
+    return len(p) == 1 and not p.get("quant_preserve")
+
+
+def calib_chunks(rows, bad_rows, get_preserve, allow = True):
+    rows = list(rows)
+    n = CALIB_BATCH if allow else 1
+    pos = 0
+    while pos < len(rows):
+        i = rows[pos]
+        if n <= 1 or not _row_batchable(i, bad_rows, get_preserve):
+            yield "one", i
+            pos += 1
+            continue
+        chunk = []
+        while pos < len(rows) and len(chunk) < n and _row_batchable(rows[pos], bad_rows, get_preserve):
+            chunk.append(rows[pos])
+            pos += 1
+        if len(chunk) == 1:
+            yield "one", chunk[0]
+        else:
+            yield "batch", chunk
+
+
+def batch_input_ids(original_input_ids, chunk):
+    ids = [original_input_ids[i] for i in chunk]
+    return torch.stack(ids, 0) if ids[0].dim() == 1 else torch.cat(ids, 0)
+
+
+def batch_states(state, chunk):
+    xs = [state[i] for i in chunk]
+    dev = xs[0].device
+    xs = [x.to(dev) for x in xs]
+    return torch.stack(xs, 0) if xs[0].dim() == 2 else torch.cat(xs, 0)
+
+
+def unbatch_states(rs, chunk, state):
+    if state[chunk[0]].dim() == 2:
+        return [rs[j] for j in range(len(chunk))]
+    return [rs[j:j + 1] for j in range(len(chunk))]
+
+
 def capture_module_parallel(
     model,
     modules,
@@ -934,11 +992,13 @@ def capture_module_parallel(
             module = modules[t_idx]
             t0 = time.time()
             done_rows = 0
-            for i in shards[t_idx]:
+
+            def one(i):
+                nonlocal done_rows
                 if i in bad_rows:
                     with lock:
                         progress_count[0] += 1
-                    continue
+                    return
                 params = {
                     "attn_mode": "flash_attn_nc",
                     "capture": captures[t_idx],
@@ -976,6 +1036,33 @@ def capture_module_parallel(
                 done_rows += 1
                 with lock:
                     progress_count[0] += 1
+
+            def batch(chunk):
+                nonlocal done_rows
+                params = {
+                    "attn_mode": "flash_attn_nc",
+                    "capture": captures[t_idx],
+                    "capture_sens": captures_sens[t_idx],
+                    "activate_all_experts": model.calibration_all_experts,
+                    "input_ids": batch_input_ids(original_input_ids, chunk),
+                    "quant_preserve": {},
+                }
+                if slicing:
+                    params["q_mlp_slice"] = current_slice
+                rs = module.prepare_for_device(batch_states(state, chunk), params)
+                rs = module.forward(rs, params)
+                if params["quant_preserve"]:
+                    raise RuntimeError("--calib_batch_rows: module uses quant_preserve, not batchable")
+                rs = None
+                done_rows += len(chunk)
+                with lock:
+                    progress_count[0] += len(chunk)
+
+            for kind, item in calib_chunks(shards[t_idx], bad_rows, get_preserve):
+                if kind == "one":
+                    one(item)
+                else:
+                    batch(item)
             torch.cuda.synchronize(torch.device(devices[t_idx]))
             auto_split.report("calib", devices[t_idx], done_rows, time.time() - t0)
         return worker
@@ -1038,11 +1125,13 @@ def advance_state_parallel(
             module = modules[t_idx]
             t0 = time.time()
             done_rows = 0
-            for i in shards[t_idx]:
+
+            def one(i):
+                nonlocal done_rows
                 if i in bad_rows:
                     with lock:
                         progress_count[0] += 1
-                    continue
+                    return
                 params = {
                     "attn_mode": "flash_attn_nc",
                     "input_ids": original_input_ids[i],
@@ -1072,6 +1161,36 @@ def advance_state_parallel(
                 done_rows += 1
                 with lock:
                     progress_count[0] += 1
+
+            def batch(chunk):
+                nonlocal done_rows
+                params = {
+                    "attn_mode": "flash_attn_nc",
+                    "input_ids": batch_input_ids(original_input_ids, chunk),
+                    "quant_preserve": {},
+                }
+                x = module.prepare_for_device(batch_states(state, chunk), params)
+                rs = module.forward(x, params)
+                x = None
+                if params["quant_preserve"]:
+                    raise RuntimeError("--calib_batch_rows: module uses quant_preserve, not batchable")
+                parts = unbatch_states(rs, chunk, state)
+                for i, r in zip(chunk, parts):
+                    if not torch.isfinite(r).all().item():
+                        with lock:
+                            bad_rows.add(i)
+                        print(f" !! Non-finite hidden state in calibration row {i}, excluding row")
+                    state[i] = r.cpu()
+                rs = None
+                done_rows += len(chunk)
+                with lock:
+                    progress_count[0] += len(chunk)
+
+            for kind, item in calib_chunks(shards[t_idx], bad_rows, get_preserve, allow = not is_last_module):
+                if kind == "one":
+                    one(item)
+                else:
+                    batch(item)
             torch.cuda.synchronize(torch.device(devices[t_idx]))
             auto_split.report("calib", devices[t_idx], done_rows, time.time() - t0)
         return worker
@@ -1156,6 +1275,10 @@ def clear_temp_files(args):
 @torch.inference_mode()
 def main(args, job_state):
     global max_progress, curr_progress, timed_blocks
+    global CALIB_BATCH
+    CALIB_BATCH = int(args.get("calib_batch_rows", 1) or 1)
+    if CALIB_BATCH > 1:
+        print(f" -- Calibration forwards batch {CALIB_BATCH} rows")
 
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -1282,11 +1405,21 @@ def main(args, job_state):
     # With multiple devices, run the capture and state-advance forward passes with calibration rows split
     # across replicas of the current module, one per device. Calibration rows are independent and the H proxy
     # is a plain sum over token batches, so shards merge exactly.
+    n_cd = int(args.get("calib_devices") or 0)
+    calib_devices = devices[:n_cd] if 0 < n_cd < len(devices) else devices
+    if calib_devices is not devices:
+        print(f" -- Calibration forwards on {len(calib_devices)} of {len(devices)} devices")
+    def calib_ratios():
+        if device_ratios is not None:
+            return device_ratios[:len(calib_devices)]
+        if len(calib_devices) == 1:
+            return None
+        return auto_split.ratios("calib", calib_devices)
     parallel_calib = (
         state is not None and
-        len(devices) > 1
+        (len(calib_devices) > 1 or CALIB_BATCH > 1)
     )
-    replica_models = [Model.from_config(config) for _ in devices[1:]] if parallel_calib else []
+    replica_models = [Model.from_config(config) for _ in calib_devices[1:]] if parallel_calib else []
 
     # Iterate over modules
     for idx, module in enumerate(model.modules):
@@ -1352,13 +1485,13 @@ def main(args, job_state):
                     capture_replicas = None
                     if parallel_calib and not module.caps.get("prefer_cpu"):
                         capture_replicas = load_parallel_calib_modules(
-                            replica_models, idx, devices, current_slice if slicing else None)
+                            replica_models, idx, calib_devices, current_slice if slicing else None)
                     if capture_replicas is not None:
                         capture_H, capture_sens, ref_states = capture_module_parallel(
                             model,
                             [module] + capture_replicas,
-                            devices,
-                            eff_ratios("calib"),
+                            calib_devices,
+                            calib_ratios(),
                             state,
                             original_input_ids,
                             get_preserve,
@@ -1499,7 +1632,7 @@ def main(args, job_state):
         advance_replicas = None
         if state is not None and parallel_calib and not module.caps.get("prefer_cpu"):
             advance_replicas = load_parallel_calib_modules(
-                replica_models, idx, devices, None, source = q_tensors)
+                replica_models, idx, calib_devices, None, source = q_tensors)
         config.stc.set_new_tensors(None)
         del q_tensors
 
@@ -1512,8 +1645,8 @@ def main(args, job_state):
                 error, cos_error, sqnr_, num_measured = advance_state_parallel(
                     model,
                     [module] + advance_replicas,
-                    devices,
-                    eff_ratios("calib"),
+                    calib_devices,
+                    calib_ratios(),
                     state,
                     original_input_ids,
                     get_preserve,
