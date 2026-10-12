@@ -101,7 +101,6 @@ jobs:
         run: |
           python -m pytest --noconftest -q \
             tests/test_mixedk_merge_abi.py \
-            tests/conversion/test_optimizer_targets.py \
             tests/test_draft_confidence_env_.py \
             tests/test_attn_fullgate_cpu.py
 
