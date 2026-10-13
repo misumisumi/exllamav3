@@ -14,16 +14,19 @@ from exllamav3.architecture.qwen3_dspark import (
 from exllamav3.architecture.dflash import DFlashModel
 from exllamav3.generator.generator import _dflash_layout
 
-CHECKPOINT = Path(
-    os.environ.get(
-        "DSPARK_CHECKPOINT",
-        "/mnt/w/sage-campaigns/minicpm47-exl3-18g/drafts/MiniCPM-V-4.7-35B-A3B-DSpark"
-        if os.name != "nt" else
-        r"W:/sage-campaigns/minicpm47-exl3-18g/drafts/MiniCPM-V-4.7-35B-A3B-DSpark",
-    )
+import pytest
+
+# Local copy of openbmb/MiniCPM-V-4.7-35B-A3B-DSpark (revision 5facb75c). Tests that read the
+# checkpoint skip unless DSPARK_CHECKPOINT points at it.
+_CHECKPOINT_ENV = os.environ.get("DSPARK_CHECKPOINT")
+CHECKPOINT = Path(_CHECKPOINT_ENV) if _CHECKPOINT_ENV else None
+needs_checkpoint = pytest.mark.skipif(
+    CHECKPOINT is None or not (CHECKPOINT / "config.json").exists(),
+    reason = "set DSPARK_CHECKPOINT to a local openbmb/MiniCPM-V-4.7-35B-A3B-DSpark directory",
 )
 
 
+@needs_checkpoint
 def test_official_architecture_constructs_with_raw_taps_and_dspark_heads():
     entry = get_architectures()["Qwen3DSparkModel"]
     assert entry["config_class"] is Qwen3DSparkConfig
@@ -40,6 +43,7 @@ def test_official_architecture_constructs_with_raw_taps_and_dspark_heads():
     assert model.markov_w1.caps["prefer_cpu"] is False
 
 
+@needs_checkpoint
 def test_anchor_is_first_of_fixed_fifteen_prediction_rows():
     config = Qwen3DSparkConfig(str(CHECKPOINT))
     assert config.block_size == 15
@@ -140,6 +144,7 @@ def test_confidence_head_returns_sigmoid_probability():
     assert torch.allclose(result, torch.sigmoid(torch.tensor([2.0])))
 
 
+@needs_checkpoint
 def test_checkpoint_consumption_audit_accounts_for_every_draft_tensor_and_borrowed_target_parts():
     from safetensors import safe_open
 
