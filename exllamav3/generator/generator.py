@@ -1076,6 +1076,8 @@ class Generator:
             input_ids = batch_ids,
             params = params,
         )
+        if self.draft_model.caps.get("dflash_sample_from_anchor", False):
+            params["dspark_rows"] = window
         new_ids = self.draft_model.sample_from_state(out_state, params)
 
         # Draft models with a confidence head cap the usable draft length per round;

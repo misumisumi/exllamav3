@@ -242,6 +242,11 @@ class Qwen3DSparkModel(DFlashModel):
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
         target = self.attached_model()
         lm_head = target.modules[target.logit_layer_idx]
+        # Only the rows the generator can verify this round need the head and the Markov walk (the window is capped
+        # by num_draft_tokens and max_verify_rows); the anchor-as-first layout keeps row r = draft r
+        rows_used = params.get("dspark_rows")
+        if rows_used is not None and self.config.sample_from_anchor and 0 < rows_used < state.shape[1]:
+            state = state[:, :rows_used].contiguous()
         logits = lm_head.forward(lm_head.prepare_for_device(state, params), params).float()
         if self.config.sample_from_anchor:
             anchor_ids = params["dspark_anchor_ids"]
