@@ -194,23 +194,25 @@ class Qwen3DSparkModel(DFlashModel):
             )
             self.modules.append(self.confidence)
         self.draft_conf_threshold = float(os.environ.get("EXL3_DSPARK_CONF", "0.5"))
+        # Markov walk over the top-K candidates of each row's base logits (the reference engines walk the top K
+        # too); 0 walks the whole vocabulary. Proposals only steer acceptance, never the verified output
+        self.markov_top_k = int(os.environ.get("EXL3_DSPARK_TOPK", "64"))
+        self._w2t = None
         self.caps.update({
             # H = identity quantization; a calibrated arm is a TODO (see the module docstring)
             "uncalibrated_quantize": True,
             "dflash_sample_from_anchor": config.sample_from_anchor,
             "default_draft_size": config.default_draft_size,
+            # One-pass verification is exact on row-invariant targets for verify windows of up to
+            # max_verify_rows rows (anchor + drafts): the decode and verify paths share kernel arithmetic
+            "max_verify_rows": int(os.environ.get("EXL3_DSPARK_MAX_VERIFY_ROWS", "8")),
         })
-        self.enable_exact_verification()
+        self.caps["exact_serial_verify"] = os.environ.get("EXL3_DSPARK_SERIAL_VERIFY", "0") == "1"
 
     def enable_exact_verification(self):
-        """Require target-authoritative one-token verification.
-
-        MiniCPM-V 4.7's target is a recurrent quantized MoE. Its multi-row
-        verification path is not numerically equivalent to ordinary one-token
-        decode after a partial recurrent-state replay, and can change greedy
-        argmax. dSparK therefore drafts a block, but the generator verifies and
-        commits each proposal through the target's normal one-token path.
-        """
+        """Verify every proposal through its own one-token target forward (slow reference path,
+        also selected with EXL3_DSPARK_SERIAL_VERIFY=1). The default one-pass verification is
+        bit-identical to it on row-invariant targets."""
         self.caps["exact_serial_verify"] = True
 
     @classmethod
@@ -254,14 +256,17 @@ class Qwen3DSparkModel(DFlashModel):
                     markov.unsqueeze(1), params, out_dtype=logits.dtype
                 ).squeeze(1)
 
-            sampled, confidence = dspark_sequential_sample(
-                logits,
-                anchor_ids=anchor_ids,
-                markov_embed_fn=markov_embed,
-                markov_bias_fn=markov_bias,
-                confidence_fn=self._confidence_function(params),
-                position_hidden=state,
-            )
+            if self.markov_top_k > 0:
+                sampled, confidence = self._sample_top_k(logits, anchor_ids, state, params)
+            else:
+                sampled, confidence = dspark_sequential_sample(
+                    logits,
+                    anchor_ids=anchor_ids,
+                    markov_embed_fn=markov_embed,
+                    markov_bias_fn=markov_bias,
+                    confidence_fn=self._confidence_function(params),
+                    position_hidden=state,
+                )
             if confidence is not None:
                 params["draft_conf"] = confidence
                 threshold = float(params.get("dspark_conf_threshold", self.draft_conf_threshold))
@@ -270,6 +275,38 @@ class Qwen3DSparkModel(DFlashModel):
                 params["draft_confidence_len"] = int(lengths.max().item())
             return sampled
         raise NotImplementedError("Qwen3 dSparK fill-in mode is not implemented")
+
+    def _sample_top_k(self, logits: torch.Tensor, anchor_ids: torch.Tensor, state: torch.Tensor, params: dict):
+        """Left-to-right Markov walk restricted to each row's top-K base candidates: per row, a K x rank gather of
+        markov_w2 instead of a full-vocabulary projection, then the confidence head on all rows in one call."""
+        vocab = self.config.vocab_size
+        base = logits[..., :vocab]
+        bsz, rows, _ = base.shape
+        k = min(self.markov_top_k, vocab)
+        top_v, top_i = torch.topk(base, k, dim=-1)                                  # (b, r, k)
+        if self._w2t is None:
+            w2 = self.markov_w2.inner.weight                                      # (rank, vocab_padded)
+            self._w2t = w2[:, :vocab].t().contiguous()                            # (vocab, rank)
+        w1 = self.markov_w1.embedding.weight                                     # (vocab, rank)
+        cand_w2 = self._w2t[top_i]                                                # (b, r, k, rank)
+        prev = anchor_ids.reshape(bsz).to(base.device)
+        out = torch.empty((bsz, rows), dtype=torch.long, device=base.device)
+        marks = []
+        for r in range(rows):
+            m = w1[prev].to(cand_w2.dtype)                                        # (b, rank)
+            marks.append(m)
+            bias = torch.bmm(cand_w2[:, r], m.unsqueeze(-1)).squeeze(-1)          # (b, k)
+            j = torch.argmax(top_v[:, r] + bias.float(), dim=-1, keepdim=True)
+            tok = top_i[:, r].gather(1, j).squeeze(1)
+            out[:, r] = tok
+            prev = tok
+        confidence = None
+        if self.confidence is not None:
+            hidden = state
+            if self.config.confidence_head_with_markov:
+                hidden = torch.cat((state, torch.stack(marks, dim=1).to(state.dtype)), dim=-1)
+            confidence = torch.sigmoid(self.confidence.forward(hidden, params).squeeze(-1).float())
+        return out, confidence
 
     def _confidence_function(self, params):
         if self.confidence is None:

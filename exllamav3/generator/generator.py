@@ -1025,6 +1025,10 @@ class Generator:
 
         # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
         window = self.num_draft_tokens
+        # Verify windows (input token + drafts) are capped where the target's one-pass verify stays exact
+        max_rows = self.draft_model.caps.get("max_verify_rows")
+        if max_rows:
+            window = min(window, max(1, max_rows - 1))
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
