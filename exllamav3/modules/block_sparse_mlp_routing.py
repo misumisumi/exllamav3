@@ -122,10 +122,9 @@ def routing_std(bsz, cfg, y, params):
         else:
             router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
             _gate_t(cfg)
-            # Use the same single-row projection, top-k, and normalization arithmetic as
-            # ordinary decode. The deterministic multi-row projection quantizes the gate
-            # differently and produces fp16-ulp routing-weight changes, which can perturb
-            # the expert contributions during speculative verification.
+            # Verify windows (2..8 rows) use the same single-row projection, top-k and normalization
+            # arithmetic as ordinary decode; the deterministic multi-row int8 projection would produce
+            # fp16-ulp routing-weight changes and break exact speculative verification
             if bsz <= 8 and _ROUTING_ROWINV:
                 # Row-batched single-row GEMV in the extension (routing_gemv_rows_kernel): bit-identical per row
                 ext.routing_std(
@@ -141,22 +140,20 @@ def routing_std(bsz, cfg, y, params):
                     cfg.gate_sb,
                 )
                 return selected_experts, routing_weights
-            for row in range(bsz):
-                ext.routing_std(
-                    y[row:row + 1],
-                    cfg.gate_tensor,
-                    cfg.router_logits_bsz1,
-                    cfg.selected_experts_bsz1,
-                    cfg.routing_weights_bsz1,
-                    cfg.per_expert_scale,
-                    cfg.gate_tensor_t,
-                    None,
-                    cfg.gate_i8,
-                    cfg.gate_sb,
-                )
-                router_logits[row].copy_(cfg.router_logits_bsz1.reshape(-1))
-                selected_experts[row].copy_(cfg.selected_experts_bsz1.reshape(-1))
-                routing_weights[row].copy_(cfg.routing_weights_bsz1.reshape(-1))
+            # Prefill-sized calls (more rows than a verify window) never need decode-equal routing: one
+            # batched projection, as before the row-invariance work
+            ext.routing_std(
+                y,
+                cfg.gate_tensor,
+                router_logits,
+                selected_experts,
+                routing_weights,
+                cfg.per_expert_scale,
+                cfg.gate_tensor_t,
+                None,
+                cfg.gate_i8,
+                cfg.gate_sb,
+            )
         return selected_experts, routing_weights
 
 
