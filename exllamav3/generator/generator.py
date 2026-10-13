@@ -647,7 +647,13 @@ class Generator:
         if self.hybrid_draft_tokens:
             draft_tokens = self.iterate_hybrid_gen(draft_tokens)
 
-        self.iterate_gen(results, draft_tokens)
+        if (
+            draft_tokens is not None and self.draft_model is not None
+            and self.draft_model.caps.get("exact_serial_verify", False)
+        ):
+            self.iterate_exact_serial_draft(results, draft_tokens)
+        else:
+            self.iterate_gen(results, draft_tokens)
 
         # Visualization
         if self.visualizer:
@@ -1103,6 +1109,78 @@ class Generator:
 
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
         return self.draft_ids_pinned[:, :window]
+
+
+    def iterate_exact_serial_draft(self, results: list, draft_tokens: torch.Tensor):
+        """Verify one draft row through the target's ordinary one-token path.
+
+        Recurrent quantized targets can produce a different greedy token after a
+        multi-row verification pass is partially replayed. For drafters that set
+        ``exact_serial_verify``, proposals remain useful acceptance candidates,
+        but every emitted token and every committed cache/state update comes from
+        the authoritative one-token target path.
+
+        The current generator's multi-row batching cannot keep different jobs at
+        different accepted-prefix depths. With more than one active row, fail
+        closed to one ordinary target step and discard the draft for this round.
+        """
+        jobs = [job for job in self.active_jobs if job.is_prefill_done()]
+        if len(jobs) != 1 or len(jobs[0].sequences) != 1:
+            self._draft_conf_round = None
+            self.iterate_gen(results, None)
+            return
+
+        job = jobs[0]
+        width = draft_tokens.shape[-1]
+        accepted = 0
+        first_result = len(results)
+
+        for idx in range(width):
+            before = len(results)
+            self.iterate_gen(results, None)
+            emitted = next((
+                r for r in results[before:]
+                if r.get("stage") == "streaming" and r.get("job") is job
+                and r.get("token_ids") is not None
+            ), None)
+
+            # A completed/requeued job or a stop condition leaves the current and
+            # remaining proposals unresolved, exactly like reject_remainder().
+            if emitted is None or emitted.get("eos") or job not in self.active_jobs:
+                job.rejected_draft_tokens += width - idx
+                break
+
+            token = int(emitted["token_ids"].view(-1)[-1].item())
+            proposal = int(draft_tokens[0, idx].item())
+            checkpoint_boundary = hasattr(job, "is_checkpoint_boundary") and job.is_checkpoint_boundary()
+            if token != proposal or checkpoint_boundary:
+                job.rejected_draft_tokens += width - idx
+                break
+
+            job.accepted_draft_tokens += 1
+            accepted += 1
+        else:
+            # Standard speculative decoding returns one target bonus token after
+            # every proposal in the block is accepted.
+            if job in self.active_jobs:
+                self.iterate_gen(results, None)
+
+        if self.record_draft_stats:
+            job.draft_stats.append((getattr(job, "new_tokens", 0), width, accepted))
+
+        # Results are built by each ordinary target step before this method can
+        # classify its proposal. Bring all events from the round up to date so
+        # API usage counters and final EOS events report the actual draft stats.
+        for result in results[first_result:]:
+            if result.get("job") is job:
+                if "accepted_draft_tokens" in result:
+                    result["accepted_draft_tokens"] = job.accepted_draft_tokens
+                if "rejected_draft_tokens" in result:
+                    result["rejected_draft_tokens"] = job.rejected_draft_tokens
+
+        # Confidence calibration is an optimization only. Never carry a block's
+        # stale confidence record into the next exact-verification round.
+        self._draft_conf_round = None
 
 
     def iterate_ngram_gen(self, results: list):

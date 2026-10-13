@@ -73,6 +73,18 @@ class Qwen3DSparkModel(DFlashModel):
             "dflash_sample_from_anchor": config.sample_from_anchor,
             "default_draft_size": config.default_draft_size,
         })
+        self.enable_exact_verification()
+
+    def enable_exact_verification(self):
+        """Require target-authoritative one-token verification.
+
+        MiniCPM-V 4.7's target is a recurrent quantized MoE. Its multi-row
+        verification path is not numerically equivalent to ordinary one-token
+        decode after a partial recurrent-state replay, and can change greedy
+        argmax. dSparK therefore drafts a block, but the generator verifies and
+        commits each proposal through the target's normal one-token path.
+        """
+        self.caps["exact_serial_verify"] = True
 
     @classmethod
     def checkpoint_tensor_consumption(cls, names):
