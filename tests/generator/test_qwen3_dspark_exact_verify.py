@@ -7,17 +7,18 @@ from exllamav3.architecture.qwen3_dspark import Qwen3DSparkModel
 
 
 class FakeJob:
-    def __init__(self):
+    def __init__(self, prefill_done=True):
         self.accepted_draft_tokens = 0
         self.rejected_draft_tokens = 0
         self.draft_stats = []
         self.sequences = [object()]
+        self.prefill_done = prefill_done
 
     def is_prefill_done(self):
-        return True
+        return self.prefill_done
 
 
-def make_generator(target_tokens, active_jobs=1):
+def make_generator(target_tokens, active_jobs=1, include_counter_fields=True):
     gen = object.__new__(Generator)
     jobs = [FakeJob() for _ in range(active_jobs)]
     gen.active_jobs = jobs
@@ -32,14 +33,18 @@ def make_generator(target_tokens, active_jobs=1):
         gen._exact_calls.append(None)
         for job in list(gen.active_jobs):
             token, eos = next(emitted)
-            results.append({
+            result = {
                 "stage": "streaming",
                 "job": job,
                 "token_ids": torch.tensor([[token]]),
                 "eos": eos,
-                "accepted_draft_tokens": job.accepted_draft_tokens,
-                "rejected_draft_tokens": job.rejected_draft_tokens,
-            })
+            }
+            if include_counter_fields:
+                result.update({
+                    "accepted_draft_tokens": job.accepted_draft_tokens,
+                    "rejected_draft_tokens": job.rejected_draft_tokens,
+                })
+            results.append(result)
             if eos:
                 gen.active_jobs.remove(job)
 
@@ -96,6 +101,31 @@ def test_exact_serial_draft_fails_closed_to_one_target_step_for_batched_jobs():
     assert len(gen._exact_calls) == 1
     assert [j.accepted_draft_tokens for j in jobs] == [0, 0]
     assert [j.rejected_draft_tokens for j in jobs] == [0, 0]
+
+
+def test_exact_serial_draft_fails_closed_when_another_active_job_is_prefilling():
+    gen, jobs = make_generator(
+        [(11, False), (22, False), (12, False), (23, False), (77, False), (24, False)],
+        active_jobs=2,
+    )
+    jobs[1].prefill_done = False
+    results = []
+
+    gen.iterate_exact_serial_draft(results, torch.tensor([[11, 12], [13, 14]]))
+
+    assert len(gen._exact_calls) == 1
+    assert [j.accepted_draft_tokens for j in jobs] == [0, 0]
+    assert [j.rejected_draft_tokens for j in jobs] == [0, 0]
+
+
+def test_exact_serial_draft_adds_final_counters_to_result_events():
+    gen, (job,) = make_generator([(99, False)], include_counter_fields=False)
+    results = []
+
+    gen.iterate_exact_serial_draft(results, torch.tensor([[11, 12]]))
+
+    assert results[-1]["accepted_draft_tokens"] == 0
+    assert results[-1]["rejected_draft_tokens"] == 2
 
 
 def test_exact_serial_draft_ignores_unused_pinned_capacity_rows():

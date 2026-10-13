@@ -1125,7 +1125,7 @@ class Generator:
         closed to one ordinary target step and discard the draft for this round.
         """
         jobs = [job for job in self.active_jobs if job.is_prefill_done()]
-        if len(jobs) != 1 or len(jobs[0].sequences) != 1:
+        if len(self.active_jobs) != 1 or len(jobs) != 1 or len(jobs[0].sequences) != 1:
             self._draft_conf_round = None
             self.iterate_gen(results, None)
             return
@@ -1173,10 +1173,8 @@ class Generator:
         # API usage counters and final EOS events report the actual draft stats.
         for result in results[first_result:]:
             if result.get("job") is job:
-                if "accepted_draft_tokens" in result:
-                    result["accepted_draft_tokens"] = job.accepted_draft_tokens
-                if "rejected_draft_tokens" in result:
-                    result["rejected_draft_tokens"] = job.rejected_draft_tokens
+                result["accepted_draft_tokens"] = job.accepted_draft_tokens
+                result["rejected_draft_tokens"] = job.rejected_draft_tokens
 
         # Confidence calibration is an optimization only. Never carry a block's
         # stale confidence record into the next exact-verification round.
