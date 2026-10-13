@@ -51,6 +51,9 @@ class MiniCPMV4_7TextModel(Qwen3_5BaseModel):
     def __init__(self, config: MiniCPMV4_7Config, **kwargs):
         super().__init__(config=config,key_prefix="model.language_model",use_moe=True,**kwargs)
         self.g_rope=MiniCPMV4_7CanvasRoPE("cpu",config.rope_settings)
+        # vocab_size 248144 is not a multiple of 128: the head is zero-padded to 248192, trim the logits back
+        # to the true vocabulary so nothing downstream sees pad columns (from r0b0tlab/exllamav3@4d083d25)
+        self.modules[self.logit_layer_idx].trim_padded_out = True
 
 
 class MiniCPMV4_7Config(Qwen3_5VLMoeBaseConfig):
