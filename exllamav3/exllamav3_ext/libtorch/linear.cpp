@@ -40,8 +40,22 @@ void BC_LinearEXL3::run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph)
     else
     {
         TORCH_CHECK(!graph || graph->disabled, "BC_LinearEXL3 invoked with graph and bsz > 1");
-        at::Tensor xh_ = at::empty_like(x);
-        exl3_gemm(x, trellis, y, suh, xh_, svh, -1, mcg, mul1, 0);
+        const int64_t rows = x.numel() / x.size(-1);
+        if (rows <= 8)
+        {
+            // Match decode arithmetic for speculative verification: decode dispatches through
+            // exl3_gemm_gr (including its specialized GEMV), while exl3_gemm uses a distinct
+            // multirow GEMM reduction order.
+            auto xf = x.reshape({rows, x.size(-1)});
+            auto yf = y.reshape({rows, y.size(-1)});
+            for (int64_t r = 0; r < rows; ++r)
+                { auto yr = yf.narrow(0, r, 1); exl3_gemm_gr(xf.narrow(0, r, 1), trellis, yr, suh, xh, svh, -1, mcg, mul1, 0, nullptr); }
+        }
+        else
+        {
+            at::Tensor xh_ = at::empty_like(x);
+            exl3_gemm(x, trellis, y, suh, xh_, svh, -1, mcg, mul1, 0);
+        }
     }
 
     if (bias)
