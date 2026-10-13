@@ -95,6 +95,11 @@ static int moe_coop_pick_ksplit(int base, int kslices, int max_split, int device
         forced = env ? atoi(env) : 0;
     }
     if (forced > 0) return std::min(forced, max_split);
+    // Row invariance (default): a k-split chosen from the slot count makes one token's expert sums depend on how
+    // many tokens share the launch, so a speculative verify could not reproduce decode. EXL3_MOE_COOP_ROWINV=0
+    // restores the occupancy-driven split
+    static const bool rowinv = [] { const char* e = std::getenv("EXL3_MOE_COOP_ROWINV"); return !e || atoi(e) != 0; }();
+    if (rowinv) return 1;
     const int want = CEIL_DIVIDE(DevCtx::instance().get_num_sms(device), std::max(base, 1));
     const int kcap = std::max(kslices / 64, 1);
     return std::max(1, std::min(std::min(want, kcap), max_split));
@@ -117,6 +122,9 @@ static bool moe_coop_pick_wide(int kslices, int slots, int device)
 {
     const int mode = moe_coop_wide_mode();
     if (mode >= 0) return mode != 0;
+    // Row invariance: tile geometry must not depend on the slot count (see moe_coop_pick_ksplit)
+    static const bool rowinv = [] { const char* e = std::getenv("EXL3_MOE_COOP_ROWINV"); return !e || atoi(e) != 0; }();
+    if (rowinv) return DevCtx::instance().get_cc(device) < CC_BLACKWELL ? true : kslices >= 128;
     if (DevCtx::instance().get_cc(device) < CC_BLACKWELL) return true;
     return kslices >= 256 || (kslices >= 128 && slots >= 32);
 }

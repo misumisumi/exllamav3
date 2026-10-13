@@ -29,7 +29,9 @@ static int exl3_gemv_int8_mode()
     // Off by default on ROCm: the RDNA fdot2 GEMVs (rocm/quant) are faster at these shapes
     _exl3_gemv_int8_mode = e ? atoi(e) : 0;
 #else
-    _exl3_gemv_int8_mode = e ? atoi(e) : 2;
+    // Off by default: the int8 sq kernel exists only for m = 1, 2, so a 3..8-row speculative verify ran a different
+    // kernel than decode and could not reproduce it. EXL3_INT8_GEMV=2 restores plain int8 activations
+    _exl3_gemv_int8_mode = e ? atoi(e) : 0;
 #endif
     _exl3_gemv_int8_mode_chk = true;
     return _exl3_gemv_int8_mode;
