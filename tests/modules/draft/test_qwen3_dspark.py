@@ -11,6 +11,7 @@ from exllamav3.architecture.qwen3_dspark import (
     dspark_sequential_sample,
     audit_checkpoint_tensors,
 )
+from exllamav3.architecture.dflash import DFlashModel
 from exllamav3.generator.generator import _dflash_layout
 
 CHECKPOINT = Path(
@@ -44,6 +45,40 @@ def test_anchor_is_first_of_fixed_fifteen_prediction_rows():
     assert config.block_size == 15
     assert config.sample_from_anchor is True
     assert config.default_draft_size == 15
+
+
+def test_forward_runs_backbone_prefix_and_never_auxiliary_heads(monkeypatch):
+    assert Qwen3DSparkModel.forward is not DFlashModel.forward
+
+    calls = []
+
+    class AddOne:
+        def prepare_for_device(self, x, params):
+            return x
+
+        def forward(self, x, params):
+            calls.append("backbone")
+            return x + 1
+
+    class AuxiliaryHead:
+        def prepare_for_device(self, x, params):
+            raise AssertionError("auxiliary head entered normal forward path")
+
+        def forward(self, x, params):
+            raise AssertionError("auxiliary head entered normal forward path")
+
+    model = object.__new__(Qwen3DSparkModel)
+    model.modules = [AddOne(), AddOne(), AuxiliaryHead()]
+    model.fwd_end_idx = 2
+    model.prepare_inputs = lambda input_ids, params: input_ids.float()
+    monkeypatch.setattr(
+        "exllamav3.architecture.qwen3_dspark.advance_recurrent_states",
+        lambda input_ids, params, active_model: calls.append("advance"),
+    )
+
+    result = model.forward(torch.tensor([[1]]), {})
+    assert result.tolist() == [[3.0]]
+    assert calls == ["backbone", "backbone", "advance"]
 
 
 def test_sequential_sampler_adds_previous_token_markov_bias_and_accepts_optional_confidence():

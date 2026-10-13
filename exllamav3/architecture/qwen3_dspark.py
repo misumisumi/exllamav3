@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import torch
+from typing_extensions import override
 
+from ..cache.recurrent_util import advance_recurrent_states
 from ..modules import Embedding, Linear
 from .dflash import DFlashConfig, DFlashModel
 
@@ -82,6 +84,19 @@ class Qwen3DSparkModel(DFlashModel):
                 raise ValueError("Qwen3 dSparK requires exactly one anchor token per request")
             params["dspark_anchor_ids"] = input_ids[:, -1]
         return super().prepare_inputs(input_ids, params)
+
+    @override
+    @torch.inference_mode
+    def forward(self, input_ids: torch.Tensor, params: dict | None = None) -> torch.Tensor:
+        """Run only the DFlash backbone; Markov/confidence heads are sampled separately."""
+        if params is None:
+            params = {}
+        x = self.prepare_inputs(input_ids, params)
+        for module in self.modules[:self.fwd_end_idx]:
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+        advance_recurrent_states(input_ids, params, self)
+        return x
 
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
         target = self.attached_model()
