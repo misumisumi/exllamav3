@@ -64,6 +64,7 @@ MIXEDK_MIN_ROWS = int(os.environ.get("EXL3_MOE_MIXEDK_MIN_ROWS", 0))
 # concurrency guarantees (every token picks top_k distinct experts). Output is bit-identical.
 # The uniform fused path's bincount (all-fused decode, run_fused(-1)) gets the same scatter-add.
 MIXEDK_NOSYNC = os.environ.get("EXL3_MOE_MIXEDK_NOSYNC", "0") == "1"
+_ROWINV_MOE = os.environ.get("EXL3_ROWINV_MOE", "0") == "1"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # Cooperative decode kernels for unified mixed-K layers (default off). At decode and verify shapes
 # (bsz <= MAX_BSZN) a mixed-K layer runs through the two-stage cooperative kernels the uniform-K
@@ -1248,6 +1249,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     @override
     def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        # Row-invariant verify: 2..MAX_BSZN rows run as independent bsz-1 calls so a batched
+        # speculative verify computes bit-identical MoE outputs to serial decode
+        rows = x.numel() // x.shape[-1]
+        if _ROWINV_MOE and 1 < rows <= MAX_BSZN and not self.alt_residual_channel                 and not params.get("autosplit_measure") and not params.get("capture_sens"):
+            xf = x.reshape(rows, 1, 1, x.shape[-1]) if x.dim() == 3 else x.reshape(rows, 1, x.shape[-1])
+            outs = [self._forward_rows(xf[r], params, out_dtype).clone() for r in range(rows)]
+            return torch.cat(outs, dim = -2).reshape(x.shape[:-1] + outs[0].shape[-1:])
+        return self._forward_rows(x, params, out_dtype)
+
+    def _forward_rows(
         self,
         x: torch.Tensor,
         params: dict,
