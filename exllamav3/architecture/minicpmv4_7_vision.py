@@ -37,7 +37,7 @@ class MiniCPMV4_7VisionModel(Model):
                 mlp_norm=LayerNorm(config,key=prefix+".layer_norm2",layernorm_eps=v.layer_norm_eps),
                 mlp=__import__("exllamav3.modules",fromlist=["MLP"]).MLP(config,key=prefix+".mlp",
                     hidden_size=v.hidden_size,intermediate_size=v.intermediate_size,key_up="fc1",key_down="fc2",
-                    activation_fn="gelu",qmap="block.mlp",pad_to=1))
+                    activation_fn="gelu",qmap="block.mlp"))
             self.blocks.append(block)
         self.vit_ln=LayerNorm(config,key="model.vision_tower.vit_merger.layer_norm1",layernorm_eps=v.layer_norm_eps)
         self.vit_attn=Attention(config,key="model.vision_tower.vit_merger.self_attn",layer_idx=27,
