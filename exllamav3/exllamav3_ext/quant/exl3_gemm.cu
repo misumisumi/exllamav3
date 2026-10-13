@@ -314,7 +314,11 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
-        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+        // Row invariance for speculative verify: every m <= 8 shares one tuning bucket, so a k-row verify pass runs
+        // the same kernel shape and k split as one-token decode (EXL3_GEMM_SMALLM_SHARED_TUNE=0: per-bucket tuning)
+        static const bool smallm_shared = [] { const char* e = std::getenv("EXL3_GEMM_SMALLM_SHARED_TUNE"); return !e || atoi(e) != 0; }();
+        int tune_m = (smallm_shared && size_m <= 8) ? 8 : MAX(size_m, 2);
+        uint64_t autotune_key = gemm_autotune_hash(tune_m, size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
 #if defined(USE_ROCM)
         autotune_key ^= 0x52444e4157313031ull;   // RDNA grid rules (below) tune separately
 #endif
@@ -752,9 +756,12 @@ int exl3_mgemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
+        // Same small-m shared bucket as exl3_gemm_gr (row invariance for speculative verify)
+        static const bool smallm_shared_m = [] { const char* e = std::getenv("EXL3_GEMM_SMALLM_SHARED_TUNE"); return !e || atoi(e) != 0; }();
+        int tune_m = (smallm_shared_m && size_m <= 8) ? 8 : size_m;
         uint64_t autotune_key = mgemm_autotune_hash
         (
-            size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out, half_k
+            tune_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out, half_k
         );
         if (had_src_list) autotune_key ^= 0x9e3779b97f4a7c15ull;   // sliced launches tune separately
 
