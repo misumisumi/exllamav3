@@ -118,18 +118,26 @@ def routing_std(bsz, cfg, y, params):
         else:
             router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
             _gate_t(cfg)
-            ext.routing_std(
-                y,
-                cfg.gate_tensor,
-                router_logits,
-                selected_experts,
-                routing_weights,
-                cfg.per_expert_scale,
-                cfg.gate_tensor_t,
-                None,
-                cfg.gate_i8,
-                cfg.gate_sb,
-            )
+            # Use the same single-row projection, top-k, and normalization arithmetic as
+            # ordinary decode. The deterministic multi-row projection quantizes the gate
+            # differently and produces fp16-ulp routing-weight changes, which can perturb
+            # the expert contributions during speculative verification.
+            for row in range(bsz):
+                ext.routing_std(
+                    y[row:row + 1],
+                    cfg.gate_tensor,
+                    cfg.router_logits_bsz1,
+                    cfg.selected_experts_bsz1,
+                    cfg.routing_weights_bsz1,
+                    cfg.per_expert_scale,
+                    cfg.gate_tensor_t,
+                    None,
+                    cfg.gate_i8,
+                    cfg.gate_sb,
+                )
+                router_logits[row].copy_(cfg.router_logits_bsz1.reshape(-1))
+                selected_experts[row].copy_(cfg.selected_experts_bsz1.reshape(-1))
+                routing_weights[row].copy_(cfg.routing_weights_bsz1.reshape(-1))
         return selected_experts, routing_weights
 
 
