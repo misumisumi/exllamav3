@@ -7,6 +7,7 @@ from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
 from .dflash import DFlashModel
+from .qwen3_dspark import Qwen3DSparkModel
 from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
@@ -80,6 +81,7 @@ ARCHITECTURES = {
         DeepseekV3Model,
         DeepseekV4Model,
         DFlashModel,
+        Qwen3DSparkModel,
         DFlash2Model,
         DFlashLagunaModel,
         Dots1Model,

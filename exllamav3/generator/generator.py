@@ -27,6 +27,12 @@ import os as _os
 _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
 _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
 
+
+def _dflash_layout(tensor: torch.Tensor, sample_from_anchor: bool) -> torch.Tensor:
+    """Align sampled IDs or confidence columns with verifier draft positions."""
+    return tensor if sample_from_anchor else tensor[:, 1:]
+
+
 class Generator:
 
     def __init__(
@@ -1070,8 +1076,11 @@ class Generator:
                 return None
             window = min(window, conf_len)
 
-        # Crop out the first token after sampling to keep batch contiguous for lm_head
-        new_ids = new_ids[:, 1:]
+        # DFlash fill-in models return [anchor, draft...], so discard their anchor.
+        # Qwen3 dSparK's sample_from_anchor layout predicts from every row, including
+        # row zero; keep all 15 predictions and do not shift its confidence columns.
+        sample_from_anchor = self.draft_model.caps.get("dflash_sample_from_anchor", False)
+        new_ids = _dflash_layout(new_ids, sample_from_anchor)
 
         # Confidence-calibrated truncation: cut the batch window at the first position whose
         # drafter confidence falls below the calibrated threshold, taking the longest cut across
@@ -1079,7 +1088,7 @@ class Generator:
         # its scores are kept so iterate_gen can label the verified positions afterwards
         draft_conf = params.get("draft_conf")
         if self.draft_calibrator is not None and draft_conf is not None:
-            conf = draft_conf[:batch_size, 1:].float().cpu()
+            conf = _dflash_layout(draft_conf[:batch_size].float(), sample_from_anchor).cpu()
             ids_full = new_ids[:batch_size, :].cpu()
             thr = self.draft_calibrator.threshold()
             below = conf[:, :window] < thr
