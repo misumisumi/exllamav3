@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include "routing.cuh"
 #include "det_gemm.cuh"
@@ -243,6 +244,51 @@ void routing_gemv_kernel
         scores[row] = __float2half_rn(sum);
 }
 
+// Row-batched form of routing_gemv_kernel: blockIdx.y picks the row, every row runs the single-row kernel's exact
+// per-expert reduction (same lane split, same fmaf order, same shuffle tree), so a speculative verify of M rows
+// selects bit-identical experts and weights to M one-token decode steps. One launch instead of M
+__global__ __launch_bounds__(RGEMV_WARPS * 32)
+void routing_gemv_rows_kernel
+(
+    const half* __restrict__ x,         // (rows, k)
+    const half* __restrict__ gate_t,    // (E, k)
+    half* __restrict__ scores,          // (rows, E)
+    const int k,
+    const int E
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * RGEMV_WARPS + warp;
+    if (row >= E) return;
+    const int r = blockIdx.y;
+
+    const half2* x2 = (const half2*) (x + (size_t) r * k);
+    const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
+
+    float sum = 0.0f;
+    for (int j = lane; j < k / 2; j += 32)
+    {
+        float2 xf = __half22float2(x2[j]);
+        float2 wf = __half22float2(w2[j]);
+        sum = fmaf(xf.x, wf.x, sum);
+        sum = fmaf(xf.y, wf.y, sum);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+
+    if (lane == 0)
+        scores[(size_t) r * E + row] = __float2half_rn(sum);
+}
+
+static bool routing_rows_rowinv()
+{
+    static int v = -1;
+    if (v < 0) { const char* e = std::getenv("EXL3_ROUTING_ROWINV"); v = (!e || atoi(e) != 0) ? 1 : 0; }
+    return v == 1;
+}
+
 void routing_gemv
 (
     const at::Tensor& hidden,
@@ -275,6 +321,21 @@ void routing_gemv
     if (gate_t.has_value() && (!gate_i8.has_value() || hidden.numel() / k <= 3) &&
         routing_gemv_rdna_try(hidden, gate_t.value(), scores, stream)) return;
 #endif
+
+    // 2..8 rows (speculative verify): the row-batched single-row GEMV, bit-identical to decode per row
+    const int64_t rows = hidden.numel() / k;
+    if (!bsz1 && rows <= 8 && routing_rows_rowinv() && gate_t.has_value() && !(k & 1) &&
+        !(((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.value().data_ptr()) & 3) && hidden.is_contiguous())
+    {
+        routing_gemv_rows_kernel<<<dim3(CEIL_DIVIDE(E, RGEMV_WARPS), (unsigned) rows), RGEMV_WARPS * 32, 0, stream>>>
+        (
+            (const half*) hidden.data_ptr(),
+            (const half*) gate_t.value().data_ptr(),
+            (half*) scores.data_ptr(),
+            k, E
+        );
+        return;
+    }
 
     if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {

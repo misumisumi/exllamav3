@@ -87,6 +87,10 @@ def _gate_t(cfg):
         ext.det_quant_weight(cfg.gate_tensor_t, cfg.gate_i8, cfg.gate_sb)
     return cfg.gate_tensor_t
 
+import os as _os
+_ROUTING_ROWINV = _os.environ.get("EXL3_ROUTING_ROWINV", "1") != "0"
+
+
 def routing_std(bsz, cfg, y, params):
     if bsz == 1:
         _gate_t(cfg)
@@ -122,6 +126,21 @@ def routing_std(bsz, cfg, y, params):
             # ordinary decode. The deterministic multi-row projection quantizes the gate
             # differently and produces fp16-ulp routing-weight changes, which can perturb
             # the expert contributions during speculative verification.
+            if bsz <= 8 and _ROUTING_ROWINV:
+                # Row-batched single-row GEMV in the extension (routing_gemv_rows_kernel): bit-identical per row
+                ext.routing_std(
+                    y.contiguous(),
+                    cfg.gate_tensor,
+                    router_logits,
+                    selected_experts,
+                    routing_weights,
+                    cfg.per_expert_scale,
+                    cfg.gate_tensor_t,
+                    None,
+                    cfg.gate_i8,
+                    cfg.gate_sb,
+                )
+                return selected_experts, routing_weights
             for row in range(bsz):
                 ext.routing_std(
                     y[row:row + 1],
