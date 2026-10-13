@@ -962,66 +962,77 @@ def _paged_attn_decode_split_kernel(
         w_span = tl.cdiv(tl.cdiv(total_k_len - w_lo, num_splits), BLOCK_N) * BLOCK_N
         n_start = w_lo + split * w_span
         n_end = tl.minimum(n_start + w_span, total_k_len)
+        c_len = tl.maximum(n_end - n_start, 1)
+        c_stride = c_len
     else:
+        # Fixed key partition: split s owns key chunks s, s + num_splits, s + 2 * num_splits, ... of split_len keys.
+        # With a fixed (num_splits, split_len) every query row sees the same chunk-to-split assignment and the same
+        # accumulation order however many query rows share the launch, so a q_len = k verify pass reproduces k
+        # single-row decode steps bit for bit (chunks past a row's causal limit are exact no-ops). When
+        # num_splits * split_len covers the sequence this is the old contiguous one-chunk-per-split layout
         n_start = split * split_len
-        n_end = tl.minimum(n_start + split_len, total_k_len)
+        n_end = total_k_len
+        c_len = split_len
+        c_stride = num_splits * split_len
 
     m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
     acc = tl.zeros((BLOCK_ROWS, HD_PAD), tl.float32)
 
-    for n0 in range(n_start, n_end, BLOCK_N):
-        offs_n = n0 + tl.arange(0, BLOCK_N)
-        page = offs_n // page_size
-        page_off = offs_n - page * page_size
-        phys = tl.load(
-            block_table + batch * num_pages_per_seq + page,
-            mask=offs_n < n_end,
-            other=0,
-        )
+    for c0 in range(n_start, n_end, c_stride):
+      c1 = tl.minimum(c0 + c_len, n_end)
+      for n0 in range(c0, c1, BLOCK_N):
+          offs_n = n0 + tl.arange(0, BLOCK_N)
+          page = offs_n // page_size
+          page_off = offs_n - page * page_size
+          phys = tl.load(
+              block_table + batch * num_pages_per_seq + page,
+              mask=offs_n < c1,
+              other=0,
+          )
 
-        if QCK > 0:
-            tok_rows = phys * page_size + page_off
-            k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim, HD_PAD)
-        else:
-            k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
-            if HD_PAD > head_dim:
-                k_tile = tl.load(k_ptrs, mask=(offs_n[None, :] < n_end) & d_mask[:, None], other=0.0)
-            else:
-                k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < n_end, other=0.0)
-        scores = tl.dot(q_tile, k_tile) * scale
-        if SOFTCAP > 0.0:
-            scores_scaled = scores / SOFTCAP
-            scores = (2.0 / (1.0 + tl.exp(-2.0 * scores_scaled)) - 1.0) * SOFTCAP
+          if QCK > 0:
+              tok_rows = phys * page_size + page_off
+              k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < c1, QCK, n_kv_heads, head_dim, HD_PAD)
+          else:
+              k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+              if HD_PAD > head_dim:
+                  k_tile = tl.load(k_ptrs, mask=(offs_n[None, :] < c1) & d_mask[:, None], other=0.0)
+              else:
+                  k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < c1, other=0.0)
+          scores = tl.dot(q_tile, k_tile) * scale
+          if SOFTCAP > 0.0:
+              scores_scaled = scores / SOFTCAP
+              scores = (2.0 / (1.0 + tl.exp(-2.0 * scores_scaled)) - 1.0) * SOFTCAP
 
-        valid = valid_row[:, None] & (offs_n[None, :] < n_end)
-        if CAUSAL:
-            valid = valid & (offs_n[None, :] <= q_abs[:, None])
-        if WINDOW_LEFT >= 0:
-            valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
-        if WINDOW_RIGHT >= 0:
-            valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
-        scores = tl.where(valid, scores, -float("inf"))
+          valid = valid_row[:, None] & (offs_n[None, :] < c1)
+          if CAUSAL:
+              valid = valid & (offs_n[None, :] <= q_abs[:, None])
+          if WINDOW_LEFT >= 0:
+              valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
+          if WINDOW_RIGHT >= 0:
+              valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
+          scores = tl.where(valid, scores, -float("inf"))
 
-        m_new = tl.maximum(m, tl.max(scores, axis=1))
-        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
-        p = tl.exp(scores - m_exp[:, None])
-        p = tl.where(valid, p, 0.0)
-        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
-        l_new = l * alpha + tl.sum(p, axis=1)
+          m_new = tl.maximum(m, tl.max(scores, axis=1))
+          m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+          p = tl.exp(scores - m_exp[:, None])
+          p = tl.where(valid, p, 0.0)
+          alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+          l_new = l * alpha + tl.sum(p, axis=1)
 
-        if QCV > 0:
-            tok_rows_v = phys * page_size + page_off
-            v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim, HD_PAD)
-        else:
-            v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
-            if HD_PAD > head_dim:
-                v_tile = tl.load(v_ptrs, mask=(offs_n[:, None] < n_end) & d_mask[None, :], other=0.0)
-            else:
-                v_tile = tl.load(v_ptrs, mask=offs_n[:, None] < n_end, other=0.0)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
-        m = m_new
-        l = l_new
+          if QCV > 0:
+              tok_rows_v = phys * page_size + page_off
+              v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < c1, QCV, n_kv_heads, head_dim, HD_PAD)
+          else:
+              v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
+              if HD_PAD > head_dim:
+                  v_tile = tl.load(v_ptrs, mask=(offs_n[:, None] < c1) & d_mask[None, :], other=0.0)
+              else:
+                  v_tile = tl.load(v_ptrs, mask=offs_n[:, None] < c1, other=0.0)
+          acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
+          m = m_new
+          l = l_new
 
     if FINAL:
         if HAS_SINKS:

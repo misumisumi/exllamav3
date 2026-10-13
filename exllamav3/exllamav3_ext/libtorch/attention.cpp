@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <Python.h>
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -393,6 +394,16 @@ void BC_Attention::configure_slot_qsa
 static inline void split_config(int bt_width, int page_size, int q_len, int block_n, int splits_cap,
                                 int* num_splits, int* split_len)
 {
+    // Fixed partition (default): split count and chunk length independent of q_len and of the block-table bound,
+    // so a q_len = k speculative verify is bit-identical to k one-token decode steps (the split kernel walks chunks
+    // s, s + num_splits, ...). EXL3_ATTN_FIXED_SPLITS=0 restores the bound-derived plan
+    static const bool fixed = [] { const char* e = std::getenv("EXL3_ATTN_FIXED_SPLITS"); return !e || atoi(e) != 0; }();
+    if (fixed)
+    {
+        *num_splits = MAX(1, splits_cap);
+        *split_len = block_n;
+        return;
+    }
     int bound = bt_width * page_size + q_len;
     *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, SPLIT_MIN_BLOCKS * block_n)));
     *split_len = CEIL_DIVIDE(CEIL_DIVIDE(bound, *num_splits), block_n) * block_n;

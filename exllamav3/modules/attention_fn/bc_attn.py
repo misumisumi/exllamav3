@@ -322,6 +322,10 @@ class BCAttn:
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
         target = 2 * _get_sm_count(dev)
+        # q_len-independent split cap (fixed partition, see split_config in attention.cpp): a verify slot must use
+        # the same split plan as the one-token decode slot of the same batch size
+        if os.environ.get("EXL3_ATTN_FIXED_SPLITS", "1") != "0":
+            split_programs = bsz * kvh
         splits_cap = max(1, min(target // split_programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
 
