@@ -30,6 +30,7 @@ from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
 from .kimi_linear import KimiLinearModel
+from .bailing_moe_v3 import BailingMoeV3Model
 from .k2_horizon import K2HorizonModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
@@ -101,6 +102,7 @@ ARCHITECTURES = {
         GlmMoeDsaModel,
         Glm5NextModel,
         KimiLinearModel,
+        BailingMoeV3Model,
         K2HorizonModel,
         GptOssModel,
         HCXVisionV2Model,

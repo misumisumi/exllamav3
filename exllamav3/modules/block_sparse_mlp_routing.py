@@ -196,8 +196,11 @@ def routing_std_bias(bsz, cfg, y, params):
 
 # TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
+    # Grouped (n_group > 1) DeepSeek-V3 routing, torch-composed. Logits and scores are fp32, as in
+    # the references (fp32 router): with hundreds of experts, fp16 sigmoid scores (and the
+    # small expert-bias offsets added to them) tie often enough to change the selection
     activate_all_experts = params.get("activate_all_experts")
-    router_logits = torch.matmul(y, cfg.gate_tensor)
+    router_logits = torch.matmul(y.float(), cfg.gate_tensor.float())
 
     scores = router_logits.sigmoid()
     scores_for_choice = scores.view(-1, cfg.num_experts)
@@ -229,7 +232,8 @@ def routing_ds3(bsz, cfg, y, params):
     denominator = topk_weights.sum(dim = -1, keepdim = True) + 1e-20
     topk_weights /= denominator
     topk_weights = topk_weights * cfg.routed_scaling_factor
-    return topk_indices, topk_weights
+    # Same output dtype as the ext routers (fp16 weights)
+    return topk_indices, topk_weights.half()
 
 
 def routing_dots(bsz, cfg, y, params):

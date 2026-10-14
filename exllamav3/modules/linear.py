@@ -197,7 +197,23 @@ class Linear(Module):
             self.used_alt_key = key == self.alt_key
             if self.used_alt_key and isinstance(key, list):
                 dev = self.device
-                weight = [self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True) for k in key]
+
+                def _part(k):
+                    # Each part dequantizes on its own: fp8 parts carry their own block/row scales
+                    # (Ling KDA q/k/v_proj fused into one qkv projection)
+                    w = self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True)
+                    s = self.config.stc.get_tensor(k + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                    si = self.config.stc.get_tensor(k + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                    assert s is None or si is None
+                    if s is not None:
+                        w = self.apply_fp8_scales_(w, s)
+                    elif si is not None:
+                        w = self.apply_fp8_scales_inv_(w, si)
+                    assert w.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2), \
+                        f"{k}: fp8 weight without a scale tensor"
+                    return w
+
+                weight = [_part(k) for k in key]
                 bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key] if self.load_bias else [None] * len(key)
                 weight = torch.cat(weight, dim = -1)
                 bias = torch.cat(bias, dim = -1) if bias[0] is not None else None

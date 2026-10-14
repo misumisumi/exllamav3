@@ -99,6 +99,7 @@ class MLAttention(Module):
         key_kv_a_norm: str = "kv_a_layernorm",
         key_kv_b: str = "kv_b_proj",
         key_o: str = "o_proj",
+        key_g: str | None = None,
         qbits_key: str = "bits",
         select_hq_bits: int = 0,
         indexer_mode: str | None = None,
@@ -181,6 +182,10 @@ class MLAttention(Module):
         self.idx_wk = None
         self.idx_k_norm = None
         self.idx_weights = None
+        # Head-wise sigmoid output gate (Ling/BailingMoeV3): o_h *= sigmoid(g_proj(x))_h before
+        # o_proj. Router-like (hidden -> num_heads, unquantized in the reference checkpoint)
+        self.key_g = key_g
+        self.g_proj = None
 
         self.cache_layers = []
         self.tp_cache_lookup = {}
@@ -253,6 +258,12 @@ class MLAttention(Module):
             select_hq_bits = select_hq_bits, qbits_key = qbits_key,
         ))
 
+        if key_g is not None:
+            self.g_proj = _sub("g_proj", lambda: Linear(
+                config, f"{key}.{key_g}", hidden_size, num_q_heads,
+                qmap = None, out_dtype = torch.float, pad_to = 1,
+            ))
+
         if indexer_mode == "full":
             assert q_lora_rank is not None, "DSA indexer queries project from the q_a latent"
             self.idx_wq_b = _sub("idx_wq_b", lambda: Linear(
@@ -281,7 +292,18 @@ class MLAttention(Module):
 
 
 
-    def _mha_form(self, q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params):
+    def _out(self, o, x, params):
+        """Output projection of the (bsz, seqlen, H * v_head_dim) attention output, with the
+        head-wise sigmoid gate applied first when the model has one"""
+        if self.g_proj is not None:
+            bsz, seqlen = o.shape[0], o.shape[1]
+            gate = torch.sigmoid(self.g_proj.forward(x, params, out_dtype = torch.float))
+            o = (o.view(bsz, seqlen, self.num_q_heads, self.v_head_dim).float() *
+                 gate.view(bsz, seqlen, self.num_q_heads, 1)).to(o.dtype) \
+                .view(bsz, seqlen, self.num_q_heads * self.v_head_dim)
+        return self.o_proj.forward(o, params)
+
+    def _mha_form(self, q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params, x = None):
         """MHA-form attention: everything (past and current chunk) is read back from the cache
         and attended over per-head up-projections. RoPE produced q_pe as a copy (the strided
         slice cannot reshape into a view), so fold it back into q's pe columns for the kernel's
@@ -299,7 +321,7 @@ class MLAttention(Module):
             qc = qc,
         )
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        return self._out(o, x, params)
 
     def cache_layer_type(self, default, kwargs: dict):
         """MLA stores a latent instead of per-head K/V, so it overrides the cache layer the Cache
@@ -912,10 +934,10 @@ class MLAttention(Module):
             o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
             del o_lat
             o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-            return self.o_proj.forward(o, params)
+            return self._out(o, x, params)
 
         if use_mha:
-            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params, x)
 
         kernel = mla_attn_triton_decode if seqlen <= MAX_DECODE_QLEN else mla_attn_triton_prefill
         extra = {}
@@ -938,7 +960,7 @@ class MLAttention(Module):
             if host_seqlens is None:
                 host_seqlens = _host_seqlens(params, cache_seqlens)
             del q_lat, q_pe_hm
-            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params, x)
 
         from .attention_fn.mla_triton import _debug_sync
         if _debug_sync:
@@ -956,7 +978,7 @@ class MLAttention(Module):
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
         del o_lat
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        return self._out(o, x, params)
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,
@@ -1015,7 +1037,8 @@ class MLAttention(Module):
         # including per-step declines (missing shared selection)
         if (
             seqlen <= MAX_DECODE_QLEN and bsz <= _bc_max_bsz and
-            params.get("causal", True) and params.get("inv_freq") is None
+            params.get("causal", True) and params.get("inv_freq") is None and
+            self.g_proj is None
         ):
             y = self.bc_mla_step(x, params, layer, block_table, cache_seqlens)
             if y is not None:
@@ -1138,7 +1161,7 @@ class MLAttention(Module):
         # so configuring the largest and smallest shapes bounds the whole family
         key = ("bcm", id(layer))
         bcm = self.dispatch_cache.get(key)
-        if bcm is None:
+        if bcm is None and self.g_proj is None:
             from .attention_fn.bc_mla import build_bc_mla
             bcm = build_bc_mla(self, layer)
         if bcm:
@@ -1200,7 +1223,7 @@ class MLAttention(Module):
     # no contribution, so the residual stream stays in step on every rank
     _tp_submodules = (
         "q_proj", "q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_proj_with_mqa",
-        "kv_a_layernorm", "o_proj", "idx_wq_b", "idx_wk", "idx_k_norm", "idx_weights",
+        "kv_a_layernorm", "o_proj", "idx_wq_b", "idx_wk", "idx_k_norm", "idx_weights", "g_proj",
     )
     _tp_tensors = ("w_uk_flat", "w_uv_flat", "idx_kpool_ape", "idx_kpool_gate")
 
@@ -1271,6 +1294,7 @@ class MLAttention(Module):
                 "rms_norm_eps": self.norm_eps,
                 "out_dtype": self.out_dtype,
                 "key_kv_b": self.key_kv_b,
+                "key_g": self.key_g,
                 "indexer_mode": self.indexer_mode,
                 "index_n_heads": self.index_n_heads,
                 "index_head_dim": self.index_head_dim,
