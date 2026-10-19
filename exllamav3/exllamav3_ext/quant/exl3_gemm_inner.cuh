@@ -68,9 +68,12 @@ void exl3_gemm_kernel_inner
     static_assert(TILESIZE_M >= 16 && TILESIZE_M % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
+    // sh_c is one buffer of sh_c_size floats (two halfs each); the 4x factor this bound
+    // used to carry was a 16-32 KB over-reservation that the 128 KiB-class parts do not
+    // need and that blocks the wider n-tile / deeper-pipeline instances.
     static_assert
     (
-        SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
+        SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 2 * sh_c_size,
         "Invalid kernel params (insufficient shared memory for shape)"
     );
 

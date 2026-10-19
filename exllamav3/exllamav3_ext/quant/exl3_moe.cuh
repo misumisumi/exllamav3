@@ -104,5 +104,7 @@ void exl3_moe_mixedk
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const int k_max,
+    const c10::optional<at::Tensor>& expert_order
 );

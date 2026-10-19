@@ -12,6 +12,11 @@ fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n256_cb2();
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2_m32();
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2_m64();
 
+// Low-K / deep-pipeline instances (MAXBITS, SH_STAGES): see exl3_moe_mixedk_inst_lowk.cu
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n256_cb2_k1();
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2_k2();
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n256_cb2_k4();
+
 extern fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances[];      // [cb_idx * 2 + N_off]
 extern fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m32[];  // [0]
 extern fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m64[];  // [0]

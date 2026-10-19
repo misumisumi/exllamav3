@@ -560,7 +560,9 @@ void exl3_moe_mixedk
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const int k_max,
+    const c10::optional<at::Tensor>& expert_order
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -569,6 +571,15 @@ void exl3_moe_mixedk
     if (num_active == 0) return;
     void* _output_scratch = nullptr;
     void* _fused_base = nullptr;
+    void* _expert_order = nullptr;
+    if (expert_order.has_value())
+    {
+        TORCH_CHECK_DTYPE(expert_order.value(), kInt);
+        TORCH_CHECK(expert_order.value().is_contiguous() && expert_order.value().dim() == 1 &&
+                    expert_order.value().size(0) >= (int64_t) expert_count.size(0) - 1,
+                    "exl3_moe_mixedk: expert_order must be a contiguous int32 [num_experts]");
+        _expert_order = expert_order.value().data_ptr();
+    }
     if (output_scratch.has_value())
     {
         TORCH_CHECK(fused_base.has_value(), "exl3_moe_mixedk: output_scratch needs fused_base");
@@ -654,10 +665,23 @@ void exl3_moe_mixedk
     }
     dim3 grid_dim(group_size, 1, num_groups);
 
+    // k_max: largest K in this launch. Only a per-tuple (grouped) dispatch or the
+    // pack-wide maximum can supply it; a launch that mixes K=1 and K=4 experts passes 8
+    // and gets the fully general instance. Specialised instances are cb2 / n256,n128 only.
+    TORCH_CHECK(k_max >= 1 && k_max <= 8, "exl3_moe_mixedk: k_max must be 1..8");
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
     fp_exl3_moe_mixedk_kernel kernel;
-    if (m_tile <= 16)
+    if (m_tile <= 16 && cb_idx == 1 && k_max <= 2)
+    {
+        kernel = (k_max <= 1) ? exl3_moe_mixedk_kernel_n256_cb2_k1()
+                              : exl3_moe_mixedk_kernel_n128_cb2_k2();
+    }
+    else if (m_tile <= 16 && cb_idx == 1 && N_off == 1 && k_max <= 4)
+    {
+        kernel = exl3_moe_mixedk_kernel_n256_cb2_k4();
+    }
+    else if (m_tile <= 16)
     {
         kernel = exl3_moe_mixedk_kernel_instances[2 * cb_idx + N_off];
     }
@@ -735,7 +759,8 @@ void exl3_moe_mixedk
         &_output_scratch,
         &_fused_base,
         (void*) &count_lo,
-        (void*) &count_hi
+        (void*) &count_hi,
+        &_expert_order
     };
 
     cudaLaunchKernel

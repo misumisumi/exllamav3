@@ -104,5 +104,7 @@
     const int64_t* __restrict__ fused_base,     \
                                                 \
     const int count_lo,                         \
-    const int count_hi
+    const int count_hi,                         \
+                                                \
+    const int* __restrict__ expert_order
 
