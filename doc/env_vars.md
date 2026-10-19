@@ -825,6 +825,36 @@ into tens of thousands of segments with large reserved-but-unallocated overhead.
 module frees its blocks; at most one boundary block shared with a neighboring module stays
 pinned. Set to `0` to fall back to per-tensor allocations.
 
+### `EXL3_ATS_MMAP` (default: `0`)
+
+Zero-copy loading for ATS systems (Grace / GB10, where the GPU shares the process page tables).
+CUDA tensors that need no conversion on load are aliased from a shared read-only mapping of the
+safetensors file instead of being copied, so the weights live in reclaimable page cache. Tensors
+off the alignment grid are copied as usual; `util/align_safetensors.py` re-lays existing models so
+nothing is. The loader counts aliased and copied bytes in `config.stc.ats_bytes`. See
+[gb10_ats_loading.md](gb10_ats_loading.md).
+
+### `EXL3_ATS_MMAP_MIN` (default: `1048576`), `EXL3_ATS_MMAP_ALIGN` (default: `16`)
+
+Smallest tensor, in bytes, that `EXL3_ATS_MMAP` aliases, and the file-offset grid required for
+int16 (EXL3 trellis) tensors. Other dtypes need only their item size. The trellis kernels fault
+with a misaligned address below 16 bytes, so lowering the alignment is for experiments only.
+
+### `EXL3_ENGRAM_ATS` (default: `1`), `EXL3_ENGRAM_PREFETCH` (default: `1`)
+
+With `EXL3_ATS_MMAP=1`, Engram layers alias their row tables and gather rows on the GPU instead of
+reading them with `pread` (not used when an `EXL3_ENGRAM_ROWS` file is given). The prefetch reads a
+forward's unique rows with a thread pool first, so the GPU gather finds their pages cached instead
+of faulting them in one at a time.
+
+### `EXL3_FP8_LAZY` (default: `0`)
+
+Keep DeepSeek FP8/FP4 block-quantized linears in their packed form and dequantize them on every
+forward instead of at load. Cuts loaded memory for those projections several times over, but the
+per-forward dequantization is memory-bandwidth bound (about 0.5 s per token on a GB10 for
+DeepSeek-V4.1 attention), so it is only useful where memory is the hard limit, such as calibration
+passes.
+
 ### `EXL3_NGRAM_STREAM` (default: `1`)
 
 Default for `Config.infer_params.ngram_stream_from_disk`: stream an n-gram embedding table

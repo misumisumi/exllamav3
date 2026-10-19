@@ -278,7 +278,12 @@ class HyperConnection(Module):
     def tp_export(self, plan, producer):
         # Streams are replicated across TP workers (like the residual), so plain replication
         return {
-            "cls": HyperConnection,
+            # type(self): DSV41HyperConnection (dsv41_hc.py:23) subclasses this. Same
+            # defect as transformer.py:232 and dsv4.py:748, found by deriving the subclass
+            # list from the class hierarchy rather than from memory. Latent so far: the
+            # per-module trace stops at block granularity, so a wrong mixer would not have
+            # shown up separately from the wrong block.
+            "cls": type(self),
             "kwargs": {
                 "key": self.key,
                 "hc_mult": self.hc_mult,
@@ -296,7 +301,7 @@ class HyperConnection(Module):
     @staticmethod
     def tp_import(local_context, exported, plan):
         consumer = local_context["consumer"]
-        module = HyperConnection(config = None, **exported["kwargs"])
+        module = exported.get("cls", HyperConnection)(config = None, **exported["kwargs"])
         module.fn = consumer.recv(exported["fn"], cuda = True)
         module.base = consumer.recv(exported["base"], cuda = True)
         module.scale = consumer.recv(exported["scale"], cuda = True)

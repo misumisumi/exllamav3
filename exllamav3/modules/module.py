@@ -171,7 +171,10 @@ class Module(ABC):
         """
         Create serializable (dict) collection of module parameters and shared weights to pass to child process.
         """
-        raise NotImplementedError()
+        raise NotImplementedError(
+            "%s has no tp_export (key=%s)" %
+            (type(self).__name__, getattr(self, "key", None))
+        )
 
     @staticmethod
     def tp_import(local_context, plan, loaded):

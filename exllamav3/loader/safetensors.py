@@ -438,6 +438,45 @@ class SafetensorsCollection:
         self.arena_enable = os.environ.get("EXL3_LOAD_ARENA", "1") != "0"
         self.deferred_arena = True
 
+        # EXL3_ATS_MMAP=1: on ATS systems (Grace/GB10, GPU shares the process page tables) CUDA
+        # tensors of at least EXL3_ATS_MMAP_MIN bytes that need no conversion alias a shared
+        # read-only mapping of the file instead of being copied. Weights then live in reclaimable
+        # page cache rather than pinned allocations, so a model can approach total system memory
+        # (doc/gb10_ats_loading.md)
+        self.ats_mmap = os.environ.get("EXL3_ATS_MMAP", "0") != "0"
+        self.ats_min_bytes = int(os.environ.get("EXL3_ATS_MMAP_MIN", str(1 << 20)))
+        self.ats_align = int(os.environ.get("EXL3_ATS_MMAP_ALIGN", "16"))
+        self.ats_maps = {}
+        self.ats_bytes = [0, 0]            # aliased, copied because off the alignment grid
+        # EXL3_ATS_COPY=<regex>: tensors whose key matches load into CUDA memory even when they
+        # could be aliased (unevictable, and mapped in large pages rather than 4 KB page cache)
+        copy_re = os.environ.get("EXL3_ATS_COPY")
+        self.ats_copy_re = re.compile(copy_re) if copy_re else None
+        self.ats_copied_policy = 0
+        # EXL3_ATS_HUGEPAGE=1: advise huge pages on the weight mappings, so page cache held in large
+        # folios (ext4 on recent kernels) is mapped with 2 MB translations instead of 4 KB ones
+        self.ats_hugepage = os.environ.get("EXL3_ATS_HUGEPAGE", "0") != "0"
+
+
+    def _ats_alias(self, filename: str, file_offset: int, bytesize: int, dtype: torch.dtype, shape, device) -> torch.Tensor:
+        import mmap, warnings
+        base = self.ats_maps.get(filename)
+        if base is None:
+            # Shared read-only mapping: a private one turns every page the GPU faults in into an
+            # anonymous copy-on-write page (measured 18.8 GiB after 200 decode tokens), which
+            # defeats the point of keeping weights in reclaimable page cache
+            with open(filename, "rb") as f:
+                mm = mmap.mmap(f.fileno(), 0, flags = mmap.MAP_SHARED, prot = mmap.PROT_READ)
+                if self.ats_hugepage and hasattr(mmap, "MADV_HUGEPAGE"):
+                    mm.madvise(mmap.MADV_HUGEPAGE)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                base = self.ats_maps[filename] = torch.frombuffer(mm, dtype = torch.uint8)
+        t = base[file_offset : file_offset + bytesize].view(dtype).view(tuple(shape))
+        device = torch.device(device)
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return ext.ats_cuda_view(t, index)
+
 
     def add_tensor_files(
         self,
@@ -459,7 +498,8 @@ class SafetensorsCollection:
             header = read_header(st_file, self.tensor_name_fixes)
             self.file_headers[st_file] = header
             for key in header.keys():
-                if key in ["__metadata__", "_header_offset"]:
+                # __align_pad__.* are gap fillers written by util/align_safetensors.py, never weights
+                if key in ["__metadata__", "_header_offset"] or key.startswith("__align_pad__."):
                     continue
                 for k, v in self.tensor_name_fixes.items():
                     if key.endswith(k):
@@ -816,6 +856,24 @@ class SafetensorsCollection:
             beg += esize * numel * fidx
             end = beg + esize * numel
             bytesize = end - beg
+
+        if (
+            self.ats_mmap and bytesize >= self.ats_min_bytes and
+            torch.device(device).type == "cuda" and not transpose and pad_to is None and
+            not (dtype == torch.bfloat16 and not allow_bf16) and not (dtype == torch.float and float2half)
+        ):
+            # EXL3 trellis kernels fault with a misaligned address unless int16 trellis data sits on
+            # a 16-byte grid (on CUDA allocations too); other dtypes need only their item size. A
+            # mapping cannot shift a file offset onto the grid, so off-grid tensors are copied
+            align = self.ats_align if dtype == torch.int16 else dtype.itemsize
+            if self.ats_copy_re is not None and self.ats_copy_re.search(key):
+                self.ats_copied_policy += bytesize
+            elif (offset + beg) % align == 0:
+                self.metrics.direct_tensors += 1
+                self.ats_bytes[0] += bytesize
+                return self._ats_alias(filename, offset + beg, bytesize, dtype, shape, device)
+            else:
+                self.ats_bytes[1] += bytesize
 
         load_method = self.load_method
         if load_method == "mt_fread" and self.deferred_mode and not no_defer:

@@ -27,6 +27,8 @@ dsv4_batch_eager = os.environ.get("EXL3_DSV4_BATCH_EAGER", "1") != "0"
 dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
 from ..constants import PAGE_SIZE
 
+
+
 # Reference: transformers models/deepseek_v4 (paper §2)
 
 def _ext_rope(x, inv_freq, position = 0, position_ids = None):
@@ -182,7 +184,7 @@ class DSV4Compressor:
         for tag, inner in [("wkv", wkv_i), ("wgate", wgate_i)]:
             if isinstance(inner, LinearEXL3):
                 args[f"{tag}_exl3"] = inner.bc
-            elif hasattr(inner, "weight") and inner.weight.dtype == torch.half:
+            elif hasattr(inner, "weight") and not getattr(inner, "lazy", False) and inner.weight.dtype == torch.half:
                 args[f"{tag}_fp16"] = ext.BC_LinearFP16(inner.weight, getattr(inner, "bias", None))
             else:
                 return
@@ -374,8 +376,11 @@ class DSV4Attention(Module):
         idx_wq_b: Linear | None = None,
         idx_weights: Linear | None = None,
         tp_defer_compressors: bool = False,
+        q_head_norm: bool = True,
     ):
         super().__init__(config = config, key = key, qmap = None)
+        # V4 applies an unweighted RMS norm to every query head before rope; V4.1 does not
+        self.q_head_norm = q_head_norm
         self.q_priority = 2 + select_hq_bits
         self.layer_idx = layer_idx
         self.layer_type = layer_type
@@ -711,7 +716,11 @@ class DSV4Attention(Module):
                 storage_dev += l.storage_size()
         for comp in (self.compressor, self.indexer):
             if comp is not None:
-                storage_dev += comp.wkv.storage_size() + comp.wgate.storage_size()
+                storage_dev += comp.wkv.storage_size()
+                # DSV41Compressor has no wgate when compress_rate == 1 (20 of 40 layers on the
+                # 1.59bpw pack); the "comp is not None" guard above does not cover that
+                if getattr(comp, "wgate", None) is not None:
+                    storage_dev += comp.wgate.storage_size()
         for rl in self.recurrent_layers:
             storage_dev += rl.storage_size()
         for cl in self.cache_layers:
@@ -748,7 +757,7 @@ class DSV4Attention(Module):
             return child.tp_export(plan, producer) if child is not None else None
 
         return {
-            "cls": DSV4Attention,
+            "cls": type(self),   # preserve the subclass (DSV41Attention)
             "kwargs": {
                 "key": self.key,
                 "layer_idx": self.layer_idx,
@@ -768,7 +777,20 @@ class DSV4Attention(Module):
                 "rope_scaling": self.rope_scaling,
                 "rms_norm_eps": self.rms_norm_eps,
                 "out_dtype": self.out_dtype,
+                # GAP #13. Defaults to True (:414) but DSV4.1 constructs every attention
+                # layer with False (architecture/deepseek_v41.py:170 and :201,
+                # deepseek_v41_mtp.py:77, dspark_v41.py:55). Omitting it here made TP
+                # workers rebuild with the default, so _rope_qkv (:971) passed q_ones
+                # instead of None and applied an unweighted RMS norm to every query
+                # head: q reached dsa_attn at std 0.999784 instead of 2.020987, and the
+                # model emitted fluent nonsense with no error anywhere.
+                "q_head_norm": self.q_head_norm,
             },
+            "kwargs41": {_a: getattr(self, _a) for _a in (
+                "is_kv_source", "is_index_source", "kv_source_layer",
+                "index_source_layer", "candidate_role", "candidate_topk_blocks",
+                "candidate_block_size", "ref_quant",
+            ) if hasattr(self, _a)},
             "num_q_heads": self.num_q_heads,
             "o_groups": self.o_groups,
             **{name: _export(getattr(self, name, None)) for name in (
@@ -780,6 +802,8 @@ class DSV4Attention(Module):
                 "wo_b",
                 "idx_wq_b",
                 "idx_weights",
+                "idx_wk",
+                "idx_k_norm",
             )},
             "wo_a": [l.tp_export(plan, producer) for l in self.wo_a],
             "sinks": producer.send(self.sinks),
@@ -829,7 +853,17 @@ class DSV4Attention(Module):
             for e in exported["wo_a"][first : last]
         ] if num_groups else []
 
-        module = DSV4Attention(
+        import inspect as _inspect
+        _cls = exported.get("cls", DSV4Attention)
+        kw = dict(kw)
+        kw.update(exported.get("kwargs41", {}))
+        if _cls is not DSV4Attention:
+            # DSV41Attention.__init__ passes layer_type='v41' positionally
+            kw.pop("layer_type", None)
+        _p = _inspect.signature(_cls.__init__).parameters
+        if not any(p.kind == p.VAR_KEYWORD for p in _p.values()):
+            kw = {k: v for k, v in kw.items() if k in _p}
+        module = _cls(
             config = None,
             **kw,
             num_q_heads = num_q_heads,
@@ -845,6 +879,12 @@ class DSV4Attention(Module):
             idx_weights = _import("idx_weights"),
             tp_defer_compressors = True,
         )
+        # V4.1 builds these in its own constructor and does not accept them as
+        # kwargs, so they are attached after construction.
+        for _n in ("idx_wk", "idx_k_norm"):
+            _e = exported.get(_n)
+            if _e is not None and num_groups:
+                setattr(module, _n, _e["cls"].tp_import(local_context, _e, plan))
         module.tp_mode = True
 
         if num_groups:
@@ -855,10 +895,10 @@ class DSV4Attention(Module):
                 first = first * hpg, last = last * hpg,
             )
             if exported.get("compressor") is not None:
-                module.compressor = DSV4Compressor.tp_import(
+                module.compressor = exported["compressor"].get("cls", DSV4Compressor).tp_import(
                     local_context, exported["compressor"], plan, module)
             if exported.get("indexer") is not None:
-                module.indexer = DSV4Compressor.tp_import(
+                module.indexer = exported["indexer"].get("cls", DSV4Compressor).tp_import(
                     local_context, exported["indexer"], plan, module)
             for rl in exported["recurrent_layers"]:
                 rli = rl["cls"](module, **rl["args"])
@@ -909,6 +949,19 @@ class DSV4Attention(Module):
         return self.inv_freq_main_neg if self.layer_type == "sliding" else self.inv_freq_compress_neg
 
 
+    def _rope_qkv(self, q, kv, position, positions):
+        """In-place head norms and rope for q (bsz, seq, Hq, D) and kv (bsz, seq, 1, D), folded into
+        the rope kernel: V4 norms every q head (unweighted) and the kv head, V4.1 only the kv head."""
+        q_w = self.q_ones if self.q_head_norm else None
+        k_w = self.kv_norm_w
+        ext.rope(
+            q, q, kv, kv,
+            self._rope_type(), position, positions, None,
+            int(RopeStyle.GPTJ), 1.0, q_w, k_w,
+            self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - self.rope_head_dim,
+        )
+
+
     def _project_qkv(self, x, params, position):
         """Shared front: q_a/q_norm/q_b and wkv, then ONE in-place ext.rope call that also
         applies both head norms (unweighted per-head q norm via a ones weight, weighted
@@ -918,12 +971,7 @@ class DSV4Attention(Module):
         q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
         q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
         kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
-        ext.rope(
-            q, q, kv, kv,
-            self._rope_type(), position, None, None,
-            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
-        )
+        self._rope_qkv(q, kv, position, None)
         return q_res, q, kv.view(bsz, seq, self.head_dim)
 
 
@@ -1551,13 +1599,7 @@ class DSV4Attention(Module):
         positions = a_pos if a_pos is not None else \
             torch.tensor([rs.position for rs in rsg[:B]], dtype = torch.int32,
                          device = x.device)
-        ext.rope(
-            q, q, kv, kv,
-            self._rope_type(), 0, positions, None,
-            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, 1,
-            self.head_dim - self.rope_head_dim,
-        )
+        self._rope_qkv(q, kv, 0, positions)
         return q_res, q, kv, comp_kv, comp_gate, idx_kv, idx_gate, q_idx
 
 
@@ -1585,6 +1627,13 @@ class DSV4Attention(Module):
             key = (id(rsl), rs.slot)
             bcd = self._bc_dsa.get(key)
             if bcd is None:
+                # The graph needs the lazily built fans (wo_a multilinear, compressor/indexer BC
+                # objects); the first call is often a short prefill that has not built them yet,
+                # and a decline is cached for the slot
+                if not self.x_fan_ready:
+                    self._build_x_fan()
+                if not self.woa_multi_ready and self.device is not None:
+                    self._build_woa_multi()
                 bcd = build_bc_dsa(self, rs, rsl, kl)
                 self._bc_dsa[key] = bcd if bcd is not None else False
             if bcd:
@@ -1660,13 +1709,7 @@ class DSV4Attention(Module):
             else:
                 q = self.q_b.forward(q_res, params).view(1, seq, self.num_q_heads, self.head_dim)
 
-            ext.rope(
-                q, q, kv, kv,
-                self._rope_type(), pos0, None, None,
-                int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-                self.rms_norm_eps, 0.0, 0.0, 0, 1,
-                self.head_dim - self.rope_head_dim,
-            )
+            self._rope_qkv(q, kv, pos0, None)
             kv = kv.view(1, seq, self.head_dim)
         else:
             q_res, q, kv = self._project_qkv(x, params, pos0)

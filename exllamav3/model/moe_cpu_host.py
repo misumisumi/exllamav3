@@ -993,15 +993,56 @@ class MoeCpuHost:
             interm_fp32 = interm_fp32,      # resident experts' gate/up output dtype (BlockSparseMLP interm_dtype)
         )
         if proj_dims is not None:
-            # Deterministic per-expert byte layout (gate, up, down), mirrored by the worker's
-            # stage function
+            # Per-expert dims: collect from all experts (supports mixed K within the layer)
             def tb(d):
                 k, n, K = d
                 return (k // 16) * (n // 16) * int(16 * K) * 2
-            gb = tb(proj_dims["g"]) if proj_dims.get("g") else 0
-            ub, db = tb(proj_dims["u"]), tb(proj_dims["d"])
-            spec["proj_bytes"] = (gb, ub, db)
-            spec["expert_bytes"] = gb + ub + db
+
+            # For each expert, collect (gate, up, down) dims. proj_dims[name] is now a list
+            # of per-expert (k, n, K) tuples, or a single tuple for backward compat
+            E = len(up_keys)
+            per_expert_dims = {}
+            for proj_name in ("g", "u", "d"):
+                if proj_dims.get(proj_name) is None:
+                    per_expert_dims[proj_name] = None
+                else:
+                    dims_list = proj_dims[proj_name]
+                    # If proj_dims already has per-expert dims (list of tuples), use them
+                    # Otherwise, assume single shared dims (backward compat)
+                    if isinstance(dims_list, list) and len(dims_list) == E and all(isinstance(d, tuple) for d in dims_list):
+                        per_expert_dims[proj_name] = dims_list
+                    else:
+                        # Single dims for all experts (original uniform case)
+                        per_expert_dims[proj_name] = [dims_list] * E
+
+            # Per-expert byte offsets: gate @ 0, up @ gate_bytes, down @ gate_bytes + up_bytes
+            expert_bytes_list = []
+            gb_list = []
+            ub_list = []
+            db_list = []
+            for e in range(E):
+                gb = tb(per_expert_dims["g"][e]) if per_expert_dims["g"] else 0
+                ub = tb(per_expert_dims["u"][e])
+                db = tb(per_expert_dims["d"][e])
+                gb_list.append(gb)
+                ub_list.append(ub)
+                db_list.append(db)
+                expert_bytes_list.append(gb + ub + db)
+
+            spec["per_expert_dims"] = per_expert_dims
+            spec["expert_bytes_list"] = expert_bytes_list
+            spec["proj_bytes_list"] = list(zip(gb_list, ub_list, db_list))
+            # For compatibility: store max and first for fallback paths
+            spec["expert_bytes"] = max(expert_bytes_list)  # max for slot sizing
+            spec["proj_bytes"] = spec["proj_bytes_list"][0]  # first for compat
+
+            # Mixed-K detection: flag if K values vary across experts in any projection
+            k_values = set()
+            for proj_name in ("g", "u", "d"):
+                if per_expert_dims.get(proj_name) is not None:
+                    for dims_tuple in per_expert_dims[proj_name]:
+                        k_values.add(dims_tuple[2])  # K is the third element
+            spec["mixed_k"] = len(k_values) > 1
         self.specs.append(spec)
         self.live_layers += 1
         idx = len(self.specs) - 1
@@ -1418,8 +1459,16 @@ class MoeCpuHost:
             pd = s.get("proj_dims")
             if pd:
                 for k in ("g", "u", "d"):
-                    if pd.get(k):
-                        mx = max(mx, pd[k][0] * pd[k][1])
+                    dims_k = pd.get(k)
+                    if dims_k:
+                        # Handle both single tuple (uniform K) and list of tuples (mixed K)
+                        if isinstance(dims_k, list):
+                            # Per-expert dims: find max numel across all experts
+                            for dims in dims_k:
+                                mx = max(mx, dims[0] * dims[1])
+                        else:
+                            # Single dims for all experts
+                            mx = max(mx, dims_k[0] * dims_k[1])
         return mx
 
     def _stream_layout(self, spec):
@@ -1632,13 +1681,17 @@ class MoeCpuHost:
 
     def _stream_recon_layer(self, st, layer_idx, spec, aux, device):
         """Batched reconstruct tier state for a streamed layer, built once per (device,
-        layer); None when disabled or the experts carry biases (a batched add would be needed)"""
+        layer); None when disabled or the experts carry biases (a batched add would be needed)
+        or when experts have mixed K values"""
         if not self.batch_recon or any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d")):
             return None
         recon = st["recon"].get(layer_idx)
         if recon is None:
             from ..modules.moe_batch_recon import BatchReconLayer
             pd = spec["proj_dims"]
+            # Skip batched reconstruct for mixed-K layers (per-expert dims are lists)
+            if any(isinstance(pd.get(k), list) for k in ("g", "u", "d")):
+                return None
             gated = pd.get("g") is not None
             scales = {p: (aux["suh_" + p], aux["svh_" + p])
                       for p in (("g", "u", "d") if gated else ("u", "d"))}
@@ -1650,8 +1703,15 @@ class MoeCpuHost:
 
     def _stream_fused_bufs(self, st, spec, device):
         """Fused-tier temp buffers for a streamed layer's (hidden, intermediate) shape, kept
-        per device (the kernel reads both dims from the buffers, so they must match the layer)"""
-        key = (spec["hi"], spec["proj_dims"]["u"][1])
+        per device (the kernel reads both dims from the buffers, so they must match the layer).
+        For mixed-K layers, use first expert dims as representative."""
+        pd_u = spec["proj_dims"]["u"]
+        # Handle per-expert dims (list) or uniform dims (tuple)
+        if isinstance(pd_u, list):
+            u_dims = pd_u[0]  # Use first expert for buffer sizing
+        else:
+            u_dims = pd_u
+        key = (spec["hi"], u_dims[1])
         fbufs = st["fused_bufs"].get(key)
         if fbufs is None:
             conc = ext.exl3_moe_max_concurrency(torch.device(device).index or 0)
@@ -1737,10 +1797,29 @@ class MoeCpuHost:
 
         aux = self.aux[layer_idx]
         pd = spec["proj_dims"]
-        gb, ub, db = spec["proj_bytes"]
-        exp_b = spec["expert_bytes"]
-        per_slot = min(self.wslot_size // exp_b, self.batch_experts)
-        gated = pd.get("g") is not None
+
+        # Mixed-K support: per-expert dims and byte offsets
+        per_expert_dims = spec.get("per_expert_dims")
+        expert_bytes_list = spec.get("expert_bytes_list", [spec["expert_bytes"]] * E)
+        gated = pd.get("g") is not None if isinstance(pd, dict) else False
+
+        # If per_expert_dims is None, fall back to uniform dims for compat
+        if per_expert_dims is None:
+            gb, ub, db = spec.get("proj_bytes", (0, 0, 0))
+            per_expert_bytes = {e: gb + ub + db for e in streamed}
+        else:
+            per_expert_bytes = {}
+            for e in streamed:
+                if gated and per_expert_dims.get("g"):
+                    gb = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * 16 * per_expert_dims["g"][e][2] * 2
+                else:
+                    gb = 0
+                ub = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * 16 * per_expert_dims["u"][e][2] * 2
+                db = (per_expert_dims["d"][e][0] // 16) * (per_expert_dims["d"][e][1] // 16) * 16 * per_expert_dims["d"][e][2] * 2
+                per_expert_bytes[e] = gb + ub + db
+
+        max_expert_bytes = max(per_expert_bytes.values()) if per_expert_bytes else spec["expert_bytes"]
+        per_slot = min(self.wslot_size // max_expert_bytes, self.batch_experts)
         abort = self.gpu_base_ptr + 128
         copy_stream = st["copy_stream"]
         # Pinned arena: per-expert (chunk, offset) of the DMA source; None = staged path
@@ -1761,12 +1840,40 @@ class MoeCpuHost:
         if fused_t and any(counts_h[e] <= fused_t for e in streamed):
             fbufs = self._stream_fused_bufs(st, spec, y.device)
 
-        for i0 in range(0, len(streamed), per_slot):
-            batch = streamed[i0:i0 + per_slot]
+        # Pack experts into slots, considering per-expert byte sizes (mixed K)
+        batches = []
+        i = 0
+        while i < len(streamed):
+            batch = []
+            slot_used = 0
+            while i < len(streamed) and len(batch) < per_slot:
+                e = streamed[i]
+                exp_b = per_expert_bytes[e]
+                if slot_used + exp_b <= self.wslot_size:
+                    batch.append((i, e))  # (position in streamed, expert id)
+                    slot_used += exp_b
+                    i += 1
+                else:
+                    break
+            if batch:
+                batches.append(batch)
+            else:
+                # Expert too large for a slot: process it alone
+                batches.append([(i, streamed[i])])
+                i += 1
+
+        for batch in batches:
             ws = self.next_wslot
             self.next_wslot = (self.next_wslot + 1) % self.num_wslots
             self.wseq += 1
             seq = self.wseq
+
+            # Compute per-expert byte offsets in this slot
+            expert_offsets = {}
+            slot_offset = 0
+            for bi, (_, e) in enumerate(batch):
+                expert_offsets[e] = slot_offset
+                slot_offset += per_expert_bytes[e]
 
             if blocks is not None:
                 # Pinned arena: DMA each expert's contiguous block straight out of the
@@ -1776,9 +1883,11 @@ class MoeCpuHost:
                     if st["wslot_used"][ws]:
                         copy_stream.wait_event(st["wconsumed_ev"][ws])
                     raw = st["vram_slots"][ws]
-                    for bi, e in enumerate(batch):
+                    for bi, (_, e) in enumerate(batch):
+                        exp_b = per_expert_bytes[e]
                         ci, off = blocks[e]
-                        raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
+                        dma_off = expert_offsets[e] // 2
+                        raw[dma_off : dma_off + exp_b // 2].copy_(
                             self.arena_views[ci][off // 2 : (off + exp_b) // 2],
                             non_blocking = True)
             else:
@@ -1798,12 +1907,12 @@ class MoeCpuHost:
                 job[4] = ws
                 job[5] = 1    # MOE_JOB_KIND_STAGE
                 job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
-                for bi, e in enumerate(batch):
+                for bi, (_, e) in enumerate(batch):
                     job[7 + bi] = e
                 self.v_stage_tail[0] = stail + 1
                 self.wslot_prev_seq[ws] = seq
 
-                used = (len(batch) * exp_b) // 2
+                used = slot_offset // 2
                 with torch.cuda.stream(copy_stream):
                     if st["wslot_used"][ws]:
                         copy_stream.wait_event(st["wconsumed_ev"][ws])
@@ -1820,16 +1929,27 @@ class MoeCpuHost:
                 copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(copy_stream):
                 if restore:
-                    # Restore the native tile order on the copy stream, one launch per
-                    # projection over the whole batch (group-0 projections in an otherwise
-                    # packed layer take the plain-copy path in the same kernel)
-                    for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
-                        if not pd.get(name):
-                            continue
-                        k, n, K = pd[name]
-                        ext.moe_unswizzle_trellis(
-                            st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
-                            k // 16, n // 16, K, layout[pi][0], layout[pi][1])
+                    # Restore the native tile order on the copy stream. One launch per (expert,
+                    # projection): a mixed-K layer packs each expert at its own bitrate into its
+                    # own slot offset, so neither the stride nor the layout policy is per layer.
+                    # A projection with neither group nor planar set takes the plain-copy path
+                    # in the same kernel
+                    for bi, (_, e) in enumerate(batch):
+                        exp_b_e = per_expert_bytes[e]
+                        off_e = expert_offsets[e]
+                        for name in ("g", "u", "d"):
+                            if not (per_expert_dims and per_expert_dims.get(name)):
+                                continue
+                            k, n, K = per_expert_dims[name][e]
+                            if TUNING.swizzle:
+                                grp, plan = (int(ext.exl3_moe_cpu_swizzle_group(K)),
+                                             int(ext.exl3_moe_cpu_planar_layout(K)))
+                            else:
+                                grp, plan = 0, 0
+                            ext.moe_unswizzle_trellis(
+                                st["vram_slots"][ws], st["native_slots"][ws], 1, exp_b_e, off_e,
+                                k // 16, n // 16, K, grp, plan)
+                            off_e += (k // 16) * (n // 16) * int(16 * K) * 2
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 
@@ -1838,71 +1958,114 @@ class MoeCpuHost:
             vslot = st["native_slots"][ws] if restore else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
-                     for bi, e in enumerate(batch)]
+                     for bi, (_, e) in enumerate(batch)]
 
-            # Mid tier: one fused kernel over the batch's cooler experts. Heavy experts stay in
-            # the descriptor (the kernel skips counts above the temp-row capacity) so the
-            # token_sorted segments line up with expert_count
-            n_fused = sum(1 for _, e, _, _ in per_e if counts_h[e] <= fused_t) if fused_t else 0
+            # Mid tier: group fused-eligible experts by (Kg, Ku, Kd) and launch one fused kernel
+            # per group. Heavy experts stay in the per-expert path.
+            fused_experts = [(bi, e, seg, wseg) for bi, e, seg, wseg in per_e if counts_h[e] <= fused_t] if fused_t else []
+
             if TUNING.stream_debug:
+                n_fused = len(fused_experts)
                 print(f" --   batch L{layer_idx} ws{ws}: {len(batch)} experts, fused_t {fused_t}, "
-                      f"n_fused {n_fused}, counts {[counts_h[e] for e in batch]}")
-            if n_fused:
+                      f"n_fused {n_fused}, counts {[counts_h[e] for _, e, _, _ in per_e]}")
+
+            if fused_experts:
                 base = vslot.data_ptr()
-                tbl = [[] for _ in range(9)]
-                for bi, e, _, _ in per_e:
-                    bb = bi * exp_b
-                    if gated:
-                        tbl[0].append(base + bb)
-                        tbl[1].append(aux["suh_g"][e].data_ptr())
-                        tbl[2].append(aux["svh_g"][e].data_ptr())
-                    tbl[3].append(base + bb + gb)
-                    tbl[4].append(aux["suh_u"][e].data_ptr())
-                    tbl[5].append(aux["svh_u"][e].data_ptr())
-                    tbl[6].append(base + bb + gb + ub)
-                    tbl[7].append(aux["suh_d"][e].data_ptr())
-                    tbl[8].append(aux["svh_d"][e].data_ptr())
-                if not gated:
-                    # Placeholder gate tables, never dereferenced (gate GEMM is skipped)
-                    for i in (0, 1, 2):
-                        tbl[i] = tbl[i + 3]
-                tblt = host_to_device(torch.tensor(tbl, dtype = torch.int64), y.device)
-                ec = host_to_device(torch.tensor([counts_h[e] for _, e, _, _ in per_e] + [0], dtype = torch.long), y.device)
-                tok = torch.cat([seg for _, _, seg, _ in per_e])
-                wts = torch.cat([wseg for _, _, _, wseg in per_e]).half()
-                Ku, Kd = pd["u"][2], pd["d"][2]
-                Kg = pd["g"][2] if gated else Ku
-                # Row-tile tiers as on the GPU side (block_sparse_mlp): one launch per tile over
-                # its expert range. Streamed experts are mul1 by construction
-                fc = [counts_h[e] for _, e, _, _ in per_e if counts_h[e] <= fused_t]
-                t1 = sum(1 for c in fc if 16 < c <= 32)
-                t2 = sum(1 for c in fc if c > 32)
-                tiers = [(t2, 33, fused_t, 64), (t1, 17, 32, 32), (len(fc) - t1 - t2, 1, 16, 16)] \
-                    if TUNING.mtile and (t1 or t2) else [(n_fused, 1, fused_t, 16)]
-                for n_act, lo, hi, mt in tiers:
-                    if not n_act:
-                        continue
-                    ext.exl3_moe(
-                        y, out, ec, tok, wts,
-                        fbufs[0], fbufs[1], fbufs[2], fbufs[3],
-                        spec["activation"], Kg, Ku, Kd,
-                        tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
-                        tblt[6], tblt[7], tblt[8],
-                        False, True, False, True, False, True,
-                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
-                    )
+
+                # Group fused experts by (Kg, Ku, Kd) for mixed K support
+                k_groups = {}
+                for bi, e, seg, wseg in fused_experts:
+                    if per_expert_dims:
+                        Kg = per_expert_dims["g"][e][2] if per_expert_dims.get("g") else (per_expert_dims["u"][e][2] if per_expert_dims.get("u") else 0)
+                        Ku = per_expert_dims["u"][e][2]
+                        Kd = per_expert_dims["d"][e][2]
+                    else:
+                        Kg = pd["g"][2] if gated else pd["u"][2]
+                        Ku = pd["u"][2]
+                        Kd = pd["d"][2]
+                    key = (Kg, Ku, Kd)
+                    if key not in k_groups:
+                        k_groups[key] = []
+                    k_groups[key].append((bi, e, seg, wseg))
+
+                # Launch fused kernel for each K group
+                for (Kg, Ku, Kd), group_experts in k_groups.items():
+                    tbl = [[] for _ in range(9)]
+                    ec_list = []
+                    tok_segments = []
+                    wts_segments = []
+
+                    for bi, e, seg, wseg in group_experts:
+                        # Compute per-expert offsets
+                        bb = base + expert_offsets[e]
+                        if per_expert_dims and per_expert_dims.get("g"):
+                            gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * 16 * per_expert_dims["g"][e][2] * 2
+                        else:
+                            gb_e = 0
+                        if per_expert_dims and per_expert_dims.get("u"):
+                            ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * 16 * per_expert_dims["u"][e][2] * 2
+                        else:
+                            ub_e = 0
+
+                        if gated:
+                            tbl[0].append(bb)
+                            tbl[1].append(aux["suh_g"][e].data_ptr())
+                            tbl[2].append(aux["svh_g"][e].data_ptr())
+                        tbl[3].append(bb + gb_e)
+                        tbl[4].append(aux["suh_u"][e].data_ptr())
+                        tbl[5].append(aux["svh_u"][e].data_ptr())
+                        tbl[6].append(bb + gb_e + ub_e)
+                        tbl[7].append(aux["suh_d"][e].data_ptr())
+                        tbl[8].append(aux["svh_d"][e].data_ptr())
+
+                        ec_list.append(counts_h[e])
+                        tok_segments.append(seg)
+                        wts_segments.append(wseg)
+
+                    if not gated:
+                        # Placeholder gate tables, never dereferenced (gate GEMM is skipped)
+                        for i in (0, 1, 2):
+                            tbl[i] = tbl[i + 3]
+
+                    tblt = host_to_device(torch.tensor(tbl, dtype = torch.int64), y.device)
+                    ec = host_to_device(torch.tensor(ec_list + [0], dtype = torch.long), y.device)
+                    tok = torch.cat(tok_segments)
+                    wts = torch.cat(wts_segments).half()
+
+                    # Row-tile tiers for this K group
+                    fc = [counts_h[e] for _, e, _, _ in group_experts if counts_h[e] <= fused_t]
+                    t1 = sum(1 for c in fc if 16 < c <= 32)
+                    t2 = sum(1 for c in fc if c > 32)
+                    tiers = [(t2, 33, fused_t, 64), (t1, 17, 32, 32), (len(fc) - t1 - t2, 1, 16, 16)] \
+                        if TUNING.mtile and (t1 or t2) else [(len(group_experts), 1, fused_t, 16)]
+                    for n_act, lo, hi, mt in tiers:
+                        if not n_act:
+                            continue
+                        ext.exl3_moe(
+                            y, out, ec, tok, wts,
+                            fbufs[0], fbufs[1], fbufs[2], fbufs[3],
+                            spec["activation"], Kg, Ku, Kd,
+                            tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
+                            tblt[6], tblt[7], tblt[8],
+                            False, True, False, True, False, True,
+                            float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
+                        )
 
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
-            # group; see moe_batch_recon.py) when eligible, else per expert
+            # group; see moe_batch_recon.py) when eligible, else per expert. Note: batched
+            # reconstruct assumes uniform K per layer, so skip it for mixed-K layers
+            has_mixed_k = spec.get("mixed_k", False)
+            recon_mixed_k = recon if not has_mixed_k else None
+
             heavy = [(bi, e) for bi, e, _, _ in per_e if not (fused_t and counts_h[e] <= fused_t)]
-            if recon is not None:
+            if recon_mixed_k is not None:
                 # Experts above the batched tier's row cap stay on the per-expert loop (large
                 # slabs pad and stream more than they save in launches)
-                single = [(bi, e) for bi, e in heavy if counts_h[e] > recon.max_rows]
-                heavy = [(bi, e) for bi, e in heavy if counts_h[e] <= recon.max_rows]
+                single = [(bi, e) for bi, e in heavy if counts_h[e] > recon_mixed_k.max_rows]
+                heavy = [(bi, e) for bi, e in heavy if counts_h[e] <= recon_mixed_k.max_rows]
             else:
-                # No batched tier (EXL3_MOE_STREAM_BATCH_RECON=0 or biased experts): every
-                # heavy expert runs on the per-expert loop below
+                # No batched tier (EXL3_MOE_STREAM_BATCH_RECON=0, biased experts, or mixed K):
+                # every heavy expert runs on the per-expert loop below
                 single = heavy
                 heavy = []
             if heavy:
@@ -1921,48 +2084,75 @@ class MoeCpuHost:
                     )
                 y_ext, tok_ext, w_ext = recon_ctx
                 base = vslot.data_ptr()
-                slot_of = {e: bi for bi, e in heavy}
-                for grp in plan_groups([e for _, e in heavy], lambda e: counts_h[e], recon.cap):
-                    # Trellis addresses inside the VRAM slot, per projection
-                    bb = [base + slot_of[e] * exp_b for e in grp]
-                    recon.run_group(
+                slot_of = {e: e for _, e, _, _ in per_e}  # Use expert offsets from expert_offsets dict
+                for grp in plan_groups([e for _, e in heavy], lambda e: counts_h[e], recon_mixed_k.cap):
+                    # Trellis addresses inside the VRAM slot, per projection (use expert_offsets)
+                    bb = [base + expert_offsets[e] for e in grp]
+                    # Compute per-expert gb, ub for this group
+                    gb_list_grp = []
+                    ub_list_grp = []
+                    for e in grp:
+                        if per_expert_dims and per_expert_dims.get("g"):
+                            gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * 16 * per_expert_dims["g"][e][2] * 2
+                        else:
+                            gb_e = 0
+                        if per_expert_dims and per_expert_dims.get("u"):
+                            ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * 16 * per_expert_dims["u"][e][2] * 2
+                        else:
+                            ub_e = 0
+                        gb_list_grp.append(gb_e)
+                        ub_list_grp.append(ub_e)
+                    recon_mixed_k.run_group(
                         y_ext, out_ext, tok_ext, w_ext,
                         grp, [offs[e] for e in grp], [counts_h[e] for e in grp],
-                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]))
+                        ptrs = (bb if gated else None, [bb[i] + gb_list_grp[i] for i in range(len(bb))],
+                               [bb[i] + gb_list_grp[i] + ub_list_grp[i] for i in range(len(bb))]))
                 heavy = []
-            single_ids = {e for _, e in single} if recon is not None else None
+            single_ids = {e for _, e in single} if recon_mixed_k is not None else None
             for bi, e, idx, wseg in per_e:
                 if fused_t and counts_h[e] <= fused_t:
                     continue
                 if single_ids is not None and e not in single_ids:
                     continue
-                boff = (bi * exp_b) // 2
+                boff_e = expert_offsets[e] // 2
                 xg = y.index_select(0, idx)
                 # Zero-pad to the quantized input width (the had transform requires it)
                 hi = spec["hi"]
                 if xg.shape[1] != hi:
                     xg = torch.nn.functional.pad(xg, (0, hi - xg.shape[1]))
                 we = wseg.float().unsqueeze(1)
+
+                # Compute per-expert byte offsets
+                gb_e = 0
+                ub_e = 0
+                if per_expert_dims and per_expert_dims.get("g"):
+                    gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * 16 * per_expert_dims["g"][e][2] * 2
+                if per_expert_dims and per_expert_dims.get("u"):
+                    ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * 16 * per_expert_dims["u"][e][2] * 2
+
                 def tview(off_b, dims):
                     k, n, K = dims
                     numel = (k // 16) * (n // 16) * int(16 * K)
-                    return vslot[boff + off_b // 2 : boff + off_b // 2 + numel] \
+                    return vslot[boff_e + off_b // 2 : boff_e + off_b // 2 + numel] \
                         .view(k // 16, n // 16, int(16 * K))
                 # Same output dtypes as the resident experts: the intermediate as the model's
                 # interm_dtype, the down projection fp32 (the activation casts to half for the
                 # down GEMM either way)
                 idt = torch.float if spec.get("interm_fp32") else torch.half
+                dg = per_expert_dims["g"][e] if per_expert_dims and per_expert_dims.get("g") else pd["g"]
+                du = per_expert_dims["u"][e] if per_expert_dims and per_expert_dims.get("u") else pd["u"]
+                dd = per_expert_dims["d"][e] if per_expert_dims and per_expert_dims.get("d") else pd["d"]
                 if gated:
-                    gy = self._dq_linear(xg, tview(0, pd["g"]), pd["g"],
+                    gy = self._dq_linear(xg, tview(0, dg), dg,
                                          aux["suh_g"][e], aux["svh_g"][e],
                                          aux["bias_g"][e] if aux.get("bias_g") else None,
                                          st["w_scratch"], out_dtype = idt)
-                uy = self._dq_linear(xg, tview(gb, pd["u"]), pd["u"],
+                uy = self._dq_linear(xg, tview(gb_e, du), du,
                                      aux["suh_u"][e], aux["svh_u"][e],
                                      aux["bias_u"][e] if aux.get("bias_u") else None,
                                      st["w_scratch"], out_dtype = idt)
                 a = self._act(spec, gy if gated else None, uy) if gated else self._act(spec, None, uy)
-                dy = self._dq_linear(a, tview(gb + ub, pd["d"]), pd["d"],
+                dy = self._dq_linear(a, tview(gb_e + ub_e, dd), dd,
                                      aux["suh_d"][e], aux["svh_d"][e],
                                      aux["bias_d"][e] if aux.get("bias_d") else None,
                                      st["w_scratch"], out_dtype = torch.float)
@@ -2026,10 +2216,7 @@ class MoeCpuHost:
                 pass
             self.conn = None
         if self.shm is not None:
-            try:
-                cuda_host_unregister(self.base_ptr)
-            except Exception:
-                pass
+            # Only attempt unregister with timeout if there's a chance the GPU is responsive
             # Drop every view over the buffer before closing, or mmap refuses to unmap
             self.slots = None
             self.wviews = None
@@ -2041,24 +2228,39 @@ class MoeCpuHost:
             self._flags_u32 = None
             import gc
             gc.collect()
-        # Pinned arena mappings: unpin, drop the views, unmap. The pages themselves die with
-        # the worker (memfd, no name to unlink; a Windows section goes with its last handle)
-        for view in self.arena_views:
+            # Skip unregister if worker died - it may hang indefinitely
             try:
-                cuda_host_unregister(view.data_ptr())
+                if self.base_ptr != 0:
+                    cuda_host_unregister(self.base_ptr)
             except Exception:
                 pass
-        self.arena_views = []
-        self.layer_blocks = []
-        maps, self.arena_maps = self.arena_maps, []
-        if maps:
-            import gc
-            gc.collect()
-            for m in maps:
+        # Pinned arena mappings: unpin, drop the views, unmap. The pages themselves die with
+        # the worker (memfd, no name to unlink). Skip if worker is dead to avoid hanging.
+        if self.proc is None or not self.proc.is_alive():
+            # Worker is dead, skip expensive unregister operations
+            for view in self.arena_views:
+                view = None
+            self.arena_views = []
+            self.layer_blocks = []
+            maps, self.arena_maps = self.arena_maps, []
+            # Don't try to unregister - worker is dead
+        else:
+            for view in self.arena_views:
                 try:
-                    m.close()
+                    cuda_host_unregister(view.data_ptr())
                 except Exception:
                     pass
+            self.arena_views = []
+            self.layer_blocks = []
+            maps, self.arena_maps = self.arena_maps, []
+            if maps:
+                import gc
+                gc.collect()
+                for m in maps:
+                    try:
+                        m.close()
+                    except Exception:
+                        pass
         if self.shm is not None:
             try:
                 self.shm.close()

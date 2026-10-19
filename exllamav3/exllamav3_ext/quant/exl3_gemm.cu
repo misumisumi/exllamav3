@@ -478,7 +478,8 @@ or q = j otherwise. This supports the following modes:
   [min_index, max_index) are removed and retained indices are rebased by
   min_index. This allows B/suh/svh to be local pointer tables for an expert
   shard. At num_tokens == 1 the retained indices (and their weights) are
-  compacted; at num_tokens > 1 out-of-range slots are instead masked to -1 in
+  compacted; at num_tokens > 1 (and num_tokens = -1, a single token whose
+  slots must keep their positions) out-of-range slots are instead masked to -1 in
   place, preserving the per-token slot groups the final reduction depends on
   (and, with bszm_in > 1, the slot -> input-row correspondence).
 

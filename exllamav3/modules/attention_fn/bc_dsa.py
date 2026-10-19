@@ -101,7 +101,12 @@ class BCDsa:
         # (state, device). The graphs bake the bt pointer; its CONTENT is refreshed once
         # per job step (the job's table row can gain valid columns as the batch table
         # widens, and a new job on the slot brings a new table)
-        num_pages = rs.cache.max_num_tokens // PAGE_SIZE
+        # kl.num_pages, not rs.cache: under TP model_tp.py:570-571 replaces the cache
+        # with id(params["cache"]), so rs.cache is an int and the old form raised
+        # AttributeError into build_bc_dsa's except (:347-353), silently disabling the
+        # whole-step graph path on every TP run. BCDsaBatch already does exactly this
+        # at :441; bt_st is only touched under has_comp (:326), matching that guard.
+        num_pages = kl.num_pages if self.has_comp else 1
         key = ("bc_dsa_pos", self.device)
         store = rs.__dict__.setdefault("_bc_dsa_pos", {})
         if key not in store:
@@ -159,7 +164,7 @@ class BCDsa:
             m.indexer.bc if self.has_idx else None,
             mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh, m.woa_indices,
             mu.K, mu.mcg, mu.mul1,
-            m.q_norm.weight.data, m.q_ones, m.kv_norm_w,
+            m.q_norm.weight.data, m.q_ones if m.q_head_norm else None, m.kv_norm_w,
             m._rope_type(), m._rope_type_neg(), m.sinks,
             rsl.ring[slot],
             rsl.comp_buf_kv[slot] if self.has_comp else None,
@@ -474,7 +479,7 @@ class BCDsaBatch:
             mu.K, mu.mcg, mu.mul1,
             self.fan["trellis"], self.fan["suh"], self.fan["svh"],
             self.fan["n"], self.fan["idx"], fk.K, fk.mcg, fk.mul1,
-            m.q_norm.weight.data, m.q_ones, m.kv_norm_w,
+            m.q_norm.weight.data, m.q_ones if m.q_head_norm else None, m.kv_norm_w,
             m._rope_type(), m._rope_type_neg(), m.sinks,
             comp.ape if self.has_comp else None,
             comp.fused_norm_w if self.has_comp else None,

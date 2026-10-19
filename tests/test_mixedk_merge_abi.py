@@ -80,5 +80,9 @@ def test_mixedk_all_three_device_arrays_use_serializer():
         assert f"const int K_{projection} = K_{projection}_arr[expert_idx];" in kernel
     for k2, bits in ((2, 1), (4, 2), (6, 3), (8, 4), (10, 5), (12, 6), (14, 7), (16, 8)):
         assert f"case {k2}:" in kernel and f"exl3_gemm_kernel_inner<{bits}, false, false, cb" in kernel
+    # Half-integer rates are mul1-only and, like the integer cases, gated on the instance's
+    # MAXBITS: an instance specialised on K <= 1 carries the 1.5-bit body, one specialised on
+    # K <= 4 drops nothing but still cannot reach 2.5 / 3.5
     for k2, bits in ((3, 1), (5, 2), (7, 3)):
-        assert f"case {k2}:  if constexpr (cb == 2) exl3_gemm_kernel_inner<{bits}, true, false, cb" in kernel
+        assert f"case {k2}:  if constexpr (cb == 2 && MAXBITS >= {bits})" in kernel
+        assert f"exl3_gemm_kernel_inner<{bits}, true, false, cb" in kernel

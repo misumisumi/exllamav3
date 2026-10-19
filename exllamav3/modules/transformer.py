@@ -236,7 +236,12 @@ class TransformerBlock(Module):
             return child.tp_export(plan, producer) if child is not None else None
 
         return {
-            "cls": TransformerBlock,
+            # type(self), not the literal: DSV41TransformerBlock (dsv41_hc.py:67)
+            # subclasses this and overrides forward() with the mHC stream path. A
+            # hardcoded base made every TP worker run the WRONG block; measured as a
+            # layer-0 prefill divergence (TP absmean 0.082819 vs non-TP 0.118984)
+            # while embed and hc_expand matched exactly.
+            "cls": type(self),
             "kwargs": {
                 "key": self.key,
                 "layer_idx": self.layer_idx,
@@ -273,7 +278,7 @@ class TransformerBlock(Module):
             return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
                 if exported.get(name) else None
 
-        module = TransformerBlock(
+        module = exported.get("cls", TransformerBlock)(
             config = None,
             **exported["kwargs"],
             attn_hc = _import("attn_hc"),

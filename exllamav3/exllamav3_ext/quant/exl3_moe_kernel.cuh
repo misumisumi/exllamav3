@@ -32,7 +32,19 @@
 // original shape (MOE_SH_STAGES / MOE_FRAG_STAGES, 2 for the 64-row tile); the mixed-K kernel
 // carries them as template parameters so deeper-pipeline variants can be built and selected at
 // launch without touching the uniform instances.
-template<int t_bits, int cb, int MT, int N_TILE, bool t_half = false, int SH = MOE_SH_STAGES, int FS_IN = 0>
+//
+// MAXBITS: the uniform-K kernels instantiate one bits value, so ptxas allocates a
+// single 128-register frame and, for N_TILE 256, spills 52 B. The mixed-K kernel has to
+// carry all eight bits cases (K is read from a device array at run time) and, measured on
+// clang-20 -> ptxas 12.9 sm_121a, that costs a 1200 B stack frame and 312 B of spill
+// stores in the hot slice loop (932 ld.local / 880 st.local in the PTX) against 432 B /
+// 52 B for the uniform-K instance at the same shape. Specialising the kernel on the
+// largest K it will see lets the launcher pick a narrower instance, which both restores
+// the uniform-K register frame and frees the shared memory that the bits=8 stage size
+// reserves, so the low-K instances can run a deeper cp.async pipeline. Only the mixed-K
+// entry points pass anything but the default; the uniform-K path (t_bits > 0) ignores it.
+template<int t_bits, int cb, int MT, int N_TILE, bool t_half = false, int SH = MOE_SH_STAGES, int FS_IN = 0,
+         int MAXBITS = 8>
 __device__ __forceinline__
 void moe_gemm_tile
 (
@@ -51,22 +63,25 @@ void moe_gemm_tile
     #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr
     #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, SH, FS
     // Runtime K arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd = the
-    // half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, the host checks)
+    // half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, the host checks). MAXBITS bounds the
+    // switch: an instance specialised on the largest K in its launch drops the wider cases' code
+    // (and their shared-memory stage size) entirely.
     if constexpr (t_bits)
         exl3_gemm_kernel_inner<t_bits, t_half, false, cb, SHAPE_ARGS, false>(ARGS);
     else switch(K)
     {
-        case 2:  exl3_gemm_kernel_inner<1, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 4:  exl3_gemm_kernel_inner<2, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 6:  exl3_gemm_kernel_inner<3, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 8:  exl3_gemm_kernel_inner<4, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 10: exl3_gemm_kernel_inner<5, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 12: exl3_gemm_kernel_inner<6, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 14: exl3_gemm_kernel_inner<7, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 16: exl3_gemm_kernel_inner<8, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 3:  if constexpr (cb == 2) exl3_gemm_kernel_inner<1, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 5:  if constexpr (cb == 2) exl3_gemm_kernel_inner<2, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 7:  if constexpr (cb == 2) exl3_gemm_kernel_inner<3, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 2:  if constexpr (MAXBITS >= 1) { exl3_gemm_kernel_inner<1, false, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 4:  if constexpr (MAXBITS >= 2) { exl3_gemm_kernel_inner<2, false, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 6:  if constexpr (MAXBITS >= 3) { exl3_gemm_kernel_inner<3, false, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 8:  if constexpr (MAXBITS >= 4) { exl3_gemm_kernel_inner<4, false, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 10:  if constexpr (MAXBITS >= 5) { exl3_gemm_kernel_inner<5, false, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 12:  if constexpr (MAXBITS >= 6) { exl3_gemm_kernel_inner<6, false, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 14:  if constexpr (MAXBITS >= 7) { exl3_gemm_kernel_inner<7, false, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 16:  if constexpr (MAXBITS >= 8) { exl3_gemm_kernel_inner<8, false, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 3:  if constexpr (cb == 2 && MAXBITS >= 1) { exl3_gemm_kernel_inner<1, true, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 5:  if constexpr (cb == 2 && MAXBITS >= 2) { exl3_gemm_kernel_inner<2, true, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        case 7:  if constexpr (cb == 2 && MAXBITS >= 3) { exl3_gemm_kernel_inner<3, true, false, cb, SHAPE_ARGS, false>(ARGS); break; } else __builtin_unreachable();
+        default: __builtin_unreachable();
     };
     #undef ARGS
     #undef SHAPE_ARGS
@@ -415,7 +430,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 
 // Mixed-K per-expert kernel: K varies per expert, always uses the runtime K dispatch (t_bits=0)
 template<int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M,
-         int SH = MOE_SH_STAGES, int FS = 0>
+         int SH = MOE_SH_STAGES, int FS = 0, int MAXBITS = 8>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_mixedk_kernel(EXL3_MOE_MIXEDK_KERNEL_ARGS)
 {
@@ -445,8 +460,15 @@ void exl3_moe_mixedk_kernel(EXL3_MOE_MIXEDK_KERNEL_ARGS)
     int end = 0;
     int expert_idx = 0;
     int expert_idx_assign = 0;
-    for (; expert_idx < num_experts; ++expert_idx)
+    // expert_order (nullable) walks the experts longest-processing-time first: the pack's
+    // K values are a load-time property, so the plugin can hand in a K-descending
+    // permutation and the greedy ticket machine then starts the 4x-expensive K=4 experts
+    // before the K=1 ones. The token rows must be permuted to match (the plugin sorts by
+    // (K rank, expert id)); start/end accumulate in that same order, and every pointer
+    // table below is indexed by the permuted expert id, not by the loop counter.
+    for (int ord_i = 0; ord_i < num_experts; ++ord_i)
     {
+        expert_idx = expert_order ? expert_order[ord_i] : ord_i;
         start = end;
         end += expert_count[expert_idx];
         int token_count = end - start;
@@ -513,18 +535,18 @@ void exl3_moe_mixedk_kernel(EXL3_MOE_MIXEDK_KERNEL_ARGS)
                 int tm;
                 if constexpr (M_TILE >= 64)
                 {
-                    if (size_m > 32)      { moe_gemm_tile<0, cb, 64, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
-                    else if (size_m > 16) { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 32)      { moe_gemm_tile<0, cb, 64, MOE_TILESIZE_N, false, SH, FS, MAXBITS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
+                    else if (size_m > 16) { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, false, SH, FS, MAXBITS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS, MAXBITS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
                 }
                 else if constexpr (M_TILE == 32)
                 {
-                    if (size_m > 16)      { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 16)      { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, false, SH, FS, MAXBITS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS, MAXBITS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
                 }
                 else
                 {
-                    moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
+                    moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, false, SH, FS, MAXBITS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
                 }
                 in_addr += tm * size_k;
                 out_addr += tm * size_n;

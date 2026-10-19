@@ -117,7 +117,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     {
         if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
         {
-            if (num_tokens > 1)
+            if (num_tokens != 1)   // num_tokens = -1: one token, position-preserving mask
             {
                 // Position-preserving mask: the grouped reduction below sums each token's
                 // fixed run of (bszm / num_tokens) slots, and with bszm_in > 1 slot j also
@@ -320,11 +320,12 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         int warps_grid = gridDim.x * blockDim.x / 32;
         int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
         int this_lane = threadIdx.x % 32;
-        int stride = bszm / num_tokens;
+        int red_tokens = num_tokens < 0 ? -num_tokens : num_tokens;
+        int stride = bszm / red_tokens;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
         {
-            for (int t = 0; t < num_tokens; ++t)
+            for (int t = 0; t < red_tokens; ++t)
             {
                 int col = this_warp * 32 + this_lane;
                 if constexpr (c_fp32)

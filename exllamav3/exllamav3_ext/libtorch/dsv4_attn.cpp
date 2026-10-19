@@ -118,7 +118,8 @@ void BC_DSV4Attention::run_gr
         c10::optional<at::Tensor> k_out = kv4;
         c10::optional<at::Tensor> positions = pos_dev;
         c10::optional<at::Tensor> no_pid = {};
-        c10::optional<at::Tensor> qn = q_ones;
+        // No q head norm (DeepSeek-V4.1): q_ones undefined -> only the kv head is normed
+        c10::optional<at::Tensor> qn = q_ones.defined() ? c10::optional<at::Tensor>(q_ones) : c10::nullopt;
         c10::optional<at::Tensor> kn = kv_norm_w;
         rope_gr
         (
@@ -428,7 +429,8 @@ void BC_DSV4BatchAttention::run_gr(const at::Tensor& x, int B, int S, Slot& s, G
         c10::optional<at::Tensor> k_in = kv4;
         c10::optional<at::Tensor> k_out = kv4;
         c10::optional<at::Tensor> no_pid = {};
-        c10::optional<at::Tensor> qn = q_ones;
+        // No q head norm (DeepSeek-V4.1): q_ones undefined -> only the kv head is normed
+        c10::optional<at::Tensor> qn = q_ones.defined() ? c10::optional<at::Tensor>(q_ones) : c10::nullopt;
         c10::optional<at::Tensor> kn = kv_norm_w;
         rope_gr
         (

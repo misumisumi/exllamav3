@@ -828,7 +828,9 @@ void exl3_moe_mixedk
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const int k_max,
+    const c10::optional<at::Tensor>& expert_order
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -837,6 +839,15 @@ void exl3_moe_mixedk
     if (num_active == 0) return;
     void* _output_scratch = nullptr;
     void* _fused_base = nullptr;
+    void* _expert_order = nullptr;
+    if (expert_order.has_value())
+    {
+        TORCH_CHECK_DTYPE(expert_order.value(), kInt);
+        TORCH_CHECK(expert_order.value().is_contiguous() && expert_order.value().dim() == 1 &&
+                    expert_order.value().size(0) >= (int64_t) expert_count.size(0) - 1,
+                    "exl3_moe_mixedk: expert_order must be a contiguous int32 [num_experts]");
+        _expert_order = expert_order.value().data_ptr();
+    }
     if (output_scratch.has_value())
     {
         TORCH_CHECK(fused_base.has_value(), "exl3_moe_mixedk: output_scratch needs fused_base");
@@ -928,11 +939,32 @@ void exl3_moe_mixedk
     }
     dim3 grid_dim(group_size, 1, num_groups);
 
+    // k_max: largest K in this launch. Only a per-tuple (grouped) dispatch or the
+    // pack-wide maximum can supply it; a launch that mixes K=1 and K=4 experts passes 8
+    // and gets the fully general instance. Specialised instances are cb2 / n256,n128 only.
+    TORCH_CHECK(k_max >= 1 && k_max <= 8, "exl3_moe_mixedk: k_max must be 1..8");
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
     fp_exl3_moe_mixedk_kernel kernel;
     const int eff_m_tile = m_tile <= 16 ? 16 : (m_tile >= 64 ? 64 : 32);
-    if (m_tile <= 16)
+    // Shape the dynamic smem request below is derived from: the low-K instances carry fewer
+    // live bits bodies, so their stage size is smaller than the general (K = 8) one
+    int bits_used = 8;
+    int n_tile_used = N_off ? 256 : 128;
+    if (m_tile <= 16 && cb_idx == 1 && k_max <= 2)
+    {
+        kernel = (k_max <= 1) ? exl3_moe_mixedk_kernel_n256_cb2_k1()
+                              : exl3_moe_mixedk_kernel_n128_cb2_k2();
+        bits_used = k_max;
+        n_tile_used = (k_max <= 1) ? 256 : 128;
+    }
+    else if (m_tile <= 16 && cb_idx == 1 && N_off == 1 && k_max <= 4)
+    {
+        kernel = exl3_moe_mixedk_kernel_n256_cb2_k4();
+        bits_used = 4;
+        n_tile_used = 256;
+    }
+    else if (m_tile <= 16)
     {
         kernel = exl3_moe_mixedk_kernel_instances[2 * cb_idx + N_off];
     }
@@ -955,11 +987,13 @@ void exl3_moe_mixedk
             kernel = exl3_moe_mixedk_kernel_instances_sh[idx];
             sh_stages_used = exl3_moe_mixedk_kernel_sh_stages[idx];
             fs_used = exl3_moe_mixedk_kernel_sh_frag[idx];
+            bits_used = 8;
+            n_tile_used = 128;
         }
     }
 
     // Size the dynamic smem to the shape instead of always reserving SMEM_MAX
-    size_t smem_bytes = exl3_moe_mixedk_smem_bytes(eff_m_tile, N_off ? 256 : 128, 8, sh_stages_used);
+    size_t smem_bytes = exl3_moe_mixedk_smem_bytes(eff_m_tile, n_tile_used, bits_used, sh_stages_used);
     int smem_override = exl3_moe_env_int("EXL3_MK_SMEM", 0);
     if (smem_override > 0) smem_bytes = (size_t) smem_override;
     smem_bytes = MIN(smem_bytes, (size_t) SMEM_MAX);
@@ -1041,7 +1075,8 @@ void exl3_moe_mixedk
         &_output_scratch,
         &_fused_base,
         (void*) &count_lo,
-        (void*) &count_hi
+        (void*) &count_hi,
+        &_expert_order
     };
 
     cudaLaunchKernel

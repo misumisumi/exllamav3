@@ -100,3 +100,22 @@ at::Tensor pinned_cuda_view(const at::Tensor& t, int64_t device)
     auto options = t.options().device(at::kCUDA, static_cast<c10::DeviceIndex>(device));
     return at::from_blob(dev_ptr, t.sizes(), t.strides(), [](void*) {}, options);
 }
+
+at::Tensor ats_cuda_view(const at::Tensor& t, int64_t device)
+{
+    // CUDA-device alias of pageable host memory on ATS systems (Grace/GB10), where the GPU
+    // shares the process page tables: the device pointer is the host address, nothing is
+    // pinned, and file-backed pages stay reclaimable page cache. The alias holds a reference
+    // to the source tensor, so the mapping lives as long as any view of it. Built from a Storage
+    // whose DataPtr names the device: at::from_blob asks the CUDA runtime which device owns the
+    // pointer, and a pageable mapping is unknown to it
+    TORCH_CHECK(t.device().is_cpu(), "ats_cuda_view: tensor must be a CPU tensor");
+    TORCH_CHECK(t.is_contiguous(), "ats_cuda_view: tensor must be contiguous");
+    c10::Device dev(c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(device));
+    auto* keep = new at::Tensor(t);
+    c10::DataPtr data_ptr(t.data_ptr(), keep, [](void* ctx) { delete static_cast<at::Tensor*>(ctx); }, dev);
+    at::Storage storage(at::Storage::use_byte_size_t(), t.nbytes(), std::move(data_ptr), nullptr, false);
+    at::Tensor out = at::empty({0}, t.options().device(dev));
+    out.set_(storage, 0, t.sizes(), t.strides());
+    return out;
+}

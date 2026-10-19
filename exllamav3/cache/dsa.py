@@ -81,7 +81,7 @@ class CacheLayer_dsa(CacheLayer):
         D_r = attention.rope_head_dim
         self.D_c = D - D_r
         self.D_r = D_r
-        self.D_i = attention.index_head_dim if attention.layer_type == "csa" else 0
+        self.D_i = attention.index_head_dim if getattr(attention, "index_pool", attention.layer_type == "csa") else 0
         if k_bits:
             assert 2 <= k_bits <= 8, "quantized DSA pool must be from 2 to 8 bits"
             assert self.D_c % 32 == 0, "quantized DSA pool requires head_dim - rope_dim to be a multiple of 32"
@@ -425,7 +425,12 @@ class DSV4LayerState:
 
     def tp_export(self, plan):
         return {
-            "cls": DSV4LayerState,
+            # type(self), not the literal: DSV41LayerState subclasses this and does not
+            # override tp_export, so hardcoding the parent made every worker rebuild it
+            # and lose pend_kv / pend_gate (dsv41.py:150-154). Same defect as the
+            # "cls": DSV4Attention hardcode in dsv4.py:748. Constructor signatures match,
+            # so the exported args are unchanged.
+            "cls": type(self),
             "args": {
                 "cache_id": self.cache_id,
                 "max_history": self.max_history,

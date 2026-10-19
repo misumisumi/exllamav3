@@ -63,6 +63,8 @@
 #include "libtorch/gated_rmsnorm.h"
 #include "libtorch/mlp.h"
 #include "libtorch/blocksparse_mlp.h"
+#include "libtorch/moe_mixed_bsz1.h"
+#include "libtorch/moe_mixedk_graph.h"
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
@@ -105,6 +107,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
+    m.def("ats_cuda_view", &ats_cuda_view, py::arg("t"), py::arg("device"));
 
     m.def("rms_norm", &rms_norm, "rms_norm",
         py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
@@ -305,7 +308,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
-    m.def("exl3_moe_mixedk", &exl3_moe_mixedk, "exl3_moe_mixedk");
+    // k_max (largest bitrate in bits, selects the low-K specialised instances) and
+    // expert_order (optional K-descending permutation) are optional
+    m.def("exl3_moe_mixedk", &exl3_moe_mixedk, "exl3_moe_mixedk",
+          py::arg("hidden_state"), py::arg("output_state"), py::arg("expert_count"), py::arg("token_sorted"),
+          py::arg("weight_sorted"), py::arg("temp_state_g"), py::arg("temp_state_u"), py::arg("temp_intermediate_g"),
+          py::arg("temp_intermediate_u"), py::arg("act_function"), py::arg("K_gate_arr"), py::arg("K_up_arr"),
+          py::arg("K_down_arr"), py::arg("gate_ptrs_trellis"), py::arg("gate_ptrs_suh"), py::arg("gate_ptrs_svh"),
+          py::arg("up_ptrs_trellis"), py::arg("up_ptrs_suh"), py::arg("up_ptrs_svh"), py::arg("down_ptrs_trellis"),
+          py::arg("down_ptrs_suh"), py::arg("down_ptrs_svh"), py::arg("gate_mcg"), py::arg("gate_mul1"),
+          py::arg("up_mcg"), py::arg("up_mul1"), py::arg("down_mcg"), py::arg("down_mul1"),
+          py::arg("act_limit"), py::arg("num_active"), py::arg("output_scratch"), py::arg("fused_base"),
+          py::arg("count_lo"), py::arg("count_hi"), py::arg("m_tile"), py::arg("k_max") = 8,
+          py::arg("expert_order") = py::none());
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 
     // Per-expert runtime-K fused decode MoE for mixed-K layers (exl3_moe_coopmk.cu)
@@ -353,6 +368,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    #include "libtorch/moe_mixed_bsz1_bc.h"
+    #include "libtorch/moe_mixedk_graph_bc.h"
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"

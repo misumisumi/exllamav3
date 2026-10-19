@@ -6,11 +6,44 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
+from .quant.fp16 import LinearFP16Lazy
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util.pinned_arena import PinnedArena
+
+import os
+
+# EXL3_FP8_LAZY=1 keeps DeepSeek-style FP8/FP4 block weights (with at least EXL3_FP8_LAZY_MIN
+# fp16 elements) in source form and dequantizes them per forward instead of once at load
+_fp8_lazy = os.environ.get("EXL3_FP8_LAZY", "0") != "0"
+_fp8_lazy_min = int(os.environ.get("EXL3_FP8_LAZY_MIN", str(1 << 22)))
+
+
+class _BlockDequant:
+    """Materializer for LinearFP16Lazy: block weight plus E8M0 scale grid, dequantized on call.
+    A row range is first trimmed to whole scale blocks so a fused source tensor isn't retained
+    in full; the result is oriented (in, out) as a view when transpose is set."""
+
+    def __init__(self, dequant, raw, scale, rows = None, transpose = False):
+        if rows is not None:
+            bh = raw.shape[0] // scale.shape[0]
+            b0, b1 = rows[0] // bh, (rows[1] + bh - 1) // bh
+            raw = raw[b0 * bh : b1 * bh].clone()
+            scale = scale[b0 : b1].clone()
+            rows = (rows[0] - b0 * bh, rows[1] - b0 * bh)
+        self.dequant = dequant
+        self.raw = raw
+        self.scale = scale
+        self.rows = rows
+        self.transpose = transpose
+
+    def __call__(self) -> torch.Tensor:
+        w = self.dequant(self.raw, self.scale)
+        if self.rows is not None:
+            w = w[self.rows[0] : self.rows[1]]
+        return w.T if self.transpose else w
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -190,6 +223,17 @@ class Linear(Module):
         return w.half()
 
 
+    def _fp8_lazy_ok(self) -> bool:
+        return (
+            _fp8_lazy and
+            not self.is_sliced and
+            self.weight_scale == 1.0 and
+            self.in_features == self.in_features_unpadded and
+            self.out_features == self.out_features_unpadded and
+            self.in_features * self.out_features >= _fp8_lazy_min
+        )
+
+
     def load_fp16(self, key: str | list[str]) -> bool:
 
         if self.config.stc.has_tensor_group(key, ["weight"]):
@@ -218,6 +262,17 @@ class Linear(Module):
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
                     w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
+                    if self._fp8_lazy_ok():
+                        self.inner = LinearFP16Lazy(
+                            self.in_features,
+                            self.out_features,
+                            _BlockDequant(self.dequant_e8m0_blocks_, w_raw, scale_q, transpose = self.transposed_load),
+                            None,
+                            self.out_dtype,
+                            key = self.key
+                        )
+                        self.quant_type = "fp16"
+                        return True
                     weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
                     if self.transposed_load:
                         weight = weight.T
@@ -381,6 +436,21 @@ class Linear(Module):
                 # whole tensor before slicing out this group's rows
                 scale_q = self.config.stc.get_tensor(self.fkey + ".scale", self.device, optional = True, no_defer = True)
                 if scale_q is not None and scale_q.dim() == 2:
+                    if self._fp8_lazy_ok():
+                        bias = self.config.stc.get_tensor(self.fkey + ".bias", self.device, optional = True, no_defer = True)
+                        self.inner = LinearFP16Lazy(
+                            self.in_features,
+                            self.out_features,
+                            _BlockDequant(
+                                self.dequant_e8m0_blocks_, weight, scale_q,
+                                rows = self.frange, transpose = self.ftranspose_after_load
+                            ),
+                            bias[self.frange[0] : self.frange[1]].contiguous() if bias is not None else None,
+                            out_dtype = self.out_dtype,
+                            key = self.key
+                        )
+                        self.quant_type = "fp16"
+                        return True
                     weight = self.dequant_e8m0_blocks_(weight, scale_q)
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
             weight = self.pad_out(weight)
@@ -501,7 +571,7 @@ class Linear(Module):
             p.copy_(t)
             return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
 
-        if isinstance(inner, LinearFP16) and inner.swap_device is None:
+        if isinstance(inner, LinearFP16) and inner.swap_device is None and not getattr(inner, "lazy", False):
             inner._pinned_store, inner.weight = pin_alias(inner.weight)
             inner.bc = ext.BC_LinearFP16(inner.weight, inner.bias)
         elif isinstance(inner, LinearEXL3):

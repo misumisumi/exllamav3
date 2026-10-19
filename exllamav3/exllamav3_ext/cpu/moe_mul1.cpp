@@ -2763,21 +2763,45 @@ void stage_phase(void* vctx, int worker, int num_workers)
     StageCtx& c = *static_cast<StageCtx*>(vctx);
     const bool gated = !c.layer->gates.empty();
     const int nmat = gated ? 3 : 2;
-    // Each (expert, matrix) is one unit; offsets accumulate expert-major in g, u, d order
-    const size_t gb = gated ? trellis_bytes(c.layer->gates[0]) : 0;
-    const size_t ub = trellis_bytes(c.layer->ups[0]);
-    const size_t db = trellis_bytes(c.layer->downs[0]);
-    const size_t per_expert = gb + ub + db;
+
+    // Compute cumulative offsets for each expert in the batch (handles mixed-K)
+    std::vector<size_t> expert_offsets(c.count + 1, 0);
+    for (int i = 0; i < c.count; ++i)
+    {
+        const int e = c.ids[i];
+        size_t gb = gated ? trellis_bytes(c.layer->gates[e]) : 0;
+        size_t ub = trellis_bytes(c.layer->ups[e]);
+        size_t db = trellis_bytes(c.layer->downs[e]);
+        expert_offsets[i + 1] = expert_offsets[i] + gb + ub + db;
+    }
+
+    // Each (expert, matrix) is one unit; copy using per-expert offsets
     for (int u = worker; u < c.count * nmat; u += num_workers)
     {
-        const int e = c.ids[u / nmat];
+        const int batch_idx = u / nmat;
+        const int e = c.ids[batch_idx];
         const int mi = u % nmat;
-        size_t off = static_cast<size_t>(u / nmat) * per_expert;
+        size_t base_off = expert_offsets[batch_idx];
+
+        // Projection offsets within expert
+        size_t proj_off = 0;
         const MoeCpuMatrix* m;
-        if (gated && mi == 0)      { m = &c.layer->gates[e]; }
-        else if (mi == (gated ? 1 : 0)) { m = &c.layer->ups[e]; off += gb; }
-        else                       { m = &c.layer->downs[e]; off += gb + ub; }
-        stage_copy_trellis(c.dst + off, *m);
+        if (gated && mi == 0)
+        {
+            m = &c.layer->gates[e];
+        }
+        else if (mi == (gated ? 1 : 0))
+        {
+            m = &c.layer->ups[e];
+            if (gated) proj_off = trellis_bytes(c.layer->gates[e]);
+        }
+        else
+        {
+            m = &c.layer->downs[e];
+            if (gated) proj_off = trellis_bytes(c.layer->gates[e]);
+            proj_off += trellis_bytes(c.layer->ups[e]);
+        }
+        stage_copy_trellis(c.dst + base_off + proj_off, *m);
     }
 }
 

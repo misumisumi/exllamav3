@@ -104,5 +104,10 @@ void exl3_moe_mixedk
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    // Largest bitrate (in bits, not half-bit units) among the experts in this launch; selects
+    // the low-K specialised mixed-K instances. 8 = the fully general instance
+    const int k_max = 8,
+    // Optional K-descending expert permutation (int32 [num_experts]); see exl3_moe_kernel.cuh
+    const c10::optional<at::Tensor>& expert_order = c10::nullopt
 );

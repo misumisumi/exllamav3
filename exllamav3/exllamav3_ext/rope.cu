@@ -235,8 +235,10 @@ void rope_kernel
             v2 *= rmf;
 
             // Downcast, apply weight and store. Lanes past head_dim / 2 (block rounded up to whole warps)
-            // hold padding and must not read the weight
-            if (active && t * 2 < head_dim)
+            // hold padding and must not read the weight. A head without a weight (q heads when only
+            // k_norm is given) still takes part in the sums and syncs above, since q and k heads share
+            // the block, but is stored back unnormalized
+            if (active && t * 2 < head_dim && norm_weight)
             {
                 if constexpr (norm_bf16)
                 {
@@ -277,7 +279,7 @@ void rope_kernel
 
         // Do the things
         load_head();
-        if (q_norm) apply_norm();
+        if (q_norm || k_norm) apply_norm();
         apply_rope();
         if (l4_scaling != 1.0f) apply_l4_scaling(head_idx < num_heads_q ? l4_scaling : 1.0f);
         store_head();
@@ -298,8 +300,8 @@ Apply position embeddings, works in-place
 - position_ids: tensor of shape (bsz, seq_len), int, optional
 - rope_mode: ROPESTYLE_NEOX
 - attn_factor: scale for sin/cos factors
-- q_norm: optional RMS norm weight, must be supplied with k_norm
-- k_norm: optional RMS norm weight, must be supplied with q_norm
+- q_norm: optional RMS norm weight for the q heads (omit to leave q unnormalized)
+- k_norm: optional RMS norm weight for the k heads (omit to leave k unnormalized); same dtype as q_norm when both are given
 - norm_eps
 - norm_constant_bias
 
@@ -416,20 +418,21 @@ void rope_gr
     void* k_norm_ptr = (void*) OPTPTR(k_norm);
     bool norm_fp16 = true;
     bool norm_bf16 = false;
-    // The kernel normalizes k heads only when q heads are, and then reads k_norm unguarded
-    TORCH_CHECK(q_norm.has_value() || !k_norm.has_value(), "rope: k_norm requires q_norm");
-    TORCH_CHECK(!q_norm.has_value() || !k.has_value() || k_norm.has_value(), "rope: q_norm with k requires k_norm");
-    if (q_norm.has_value())
+    // Norm weights may be given for q, k or both (DeepSeek-V4.1 norms only the kv head); the kernel's
+    // weight dtype comes from whichever is present. A head without a weight is stored back unnormalized
+    if (q_norm_ptr || k_norm_ptr)
     {
         TORCH_CHECK(head_dim > 0, "rope: q/k norm over an empty head_dim");
-        TORCH_CHECK_DIM(q_norm.value(), 1);
-        TORCH_CHECK(q_norm.value().size(0) == head_dim, "q_norm is incorrect size");
-        norm_bf16 = q_norm.value().dtype() == at::kBFloat16;
-        norm_fp16 = q_norm.value().dtype() == at::kHalf;
-        if (k_norm.has_value())
+        const at::Tensor& nw = q_norm_ptr ? q_norm.value() : k_norm.value();
+        TORCH_CHECK_DIM(nw, 1);
+        TORCH_CHECK(nw.size(0) == head_dim, "q_norm / k_norm is incorrect size");
+        norm_bf16 = nw.dtype() == at::kBFloat16;
+        norm_fp16 = nw.dtype() == at::kHalf;
+        if (k_norm_ptr)
         {
-            TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
             TORCH_CHECK(k_norm.value().dim() == 1 && k_norm.value().size(0) == head_dim, "k_norm is incorrect size");
+            if (q_norm_ptr)
+                TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
         }
     }
 

@@ -93,7 +93,7 @@ class LinearFP16:
         if dtype == x.dtype:
             torch.matmul(x, weight, out = y)
         else:
-            ext.hgemm(x, weight, y)
+            ext.hgemm(x, weight.contiguous(), y)
         if self.bias is not None:
             y += self.bias
         y = y.view(out_shape)
@@ -215,6 +215,48 @@ class LinearFP16:
             out_dtype = exported["out_dtype"],
         )
         return module
+
+
+class LinearFP16Lazy(LinearFP16):
+    """FP16 linear whose weight stays in a compact source form and is materialized on each
+    access by a callable returning the (in_features, out_features) weight, possibly as a
+    transposed view. Trades a per-forward dequant for the fp16 copy's memory on hosts where
+    every byte counts (unified memory). No BC object, so graph paths decline it."""
+
+    lazy = True
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        materialize,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype | None = None,
+        key: str | None = None
+    ):
+        self._materialize = materialize
+        self._pinned_store = None
+        if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bias = bias
+        self.swap_device = None
+        self.full_in_features = in_features
+        self.full_out_features = out_features
+        self.first_in_feature = 0
+        self.first_out_feature = 0
+        self.out_dtype = out_dtype
+        self.key = key
+        self.bc = None
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self._materialize()
+
+    @weight.setter
+    def weight(self, w: torch.Tensor):
+        # Any explicit assignment (swap_cpu, set_weight) turns this into a plain stored weight
+        self._materialize = lambda: w
 
 
 class LinearFP16_torch:

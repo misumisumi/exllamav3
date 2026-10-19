@@ -686,6 +686,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.mixedk_K_gate_arr = _kg
                 self.mixedk_K_up_arr = _ku
                 self.mixedk_K_down_arr = _kd
+                # Largest bitrate in the layer, back in bits (the arrays hold half-bit units):
+                # selects the low-K specialised mixed-K instances (a K = 4 layer takes the k4
+                # instance; a layer mixing K = 1 and K = 4 passes 4 and still gets it, since the
+                # switch covers every K <= k_max)
+                self.mixedk_k_max = int((max(int(_kg.max()), int(_ku.max()), int(_kd.max())) + 1) // 2)
                 # Build unified pointer tables for ALL experts
                 self.mixedk_ptrs_gate_trellis = _torch.tensor(
                     [(self.gates[i].inner.trellis.data_ptr() if self.gated else self.ups[i].inner.trellis.data_ptr()) for i in range(_ne)],
@@ -1673,6 +1678,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 num_active,
                                 scratch, tables[0] if tables is not None else None,
                                 count_lo, count_hi, m_tile,
+                                self.mixedk_k_max,
                             )
                         t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
                         t2 = sum(1 for c in counts_fused if c > MTILE_T2)
