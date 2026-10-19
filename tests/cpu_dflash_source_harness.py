@@ -177,6 +177,20 @@ NS_GLOBALS = {
     "tensor_hash_checksum": lambda tensor, prev: hashlib.blake2b(
         (prev or b"") + repr(tensor.tolist()).encode(), digest_size=16).digest(),
 }
+def extract_function(relative, name, namespace):
+    """Execute one module-level function's unchanged AST into ``namespace``."""
+    path = ROOT / relative
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    node = copy.deepcopy(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name))
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    module = ast.fix_missing_locations(ast.Module(body=[future, node], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[name]
+
+
+# Module-level helpers the extracted Generator methods call by global name.
+extract_function("exllamav3/generator/generator.py", "_dflash_layout", NS_GLOBALS)
+
 Generator = extract_class("exllamav3/generator/generator.py", "Generator",
                           ["__init__", "_staging", "iterate_draftmodel_dflash_gen"], NS_GLOBALS)
 Sequence = extract_class("exllamav3/generator/pagetable.py", "Sequence",
