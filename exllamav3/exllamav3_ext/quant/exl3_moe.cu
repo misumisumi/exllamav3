@@ -518,6 +518,26 @@ fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m64[] =
     exl3_moe_mixedk_kernel_n128_cb2_m64()
 };
 
+// Dynamic shared memory each instance actually indexes, in bytes (see moe_smem_bytes).
+// Requested verbatim at launch: SMEM_MAX (90 KiB) is 3x what any tk16 shape needs and
+// is what stops a second CTA from being resident on a 100 KiB/SM part.
+int exl3_moe_mixedk_smem_instances[] =
+{
+    // [cb_idx * 2 + N_off]
+    exl3_moe_mixedk_smem_n128_cb1(), exl3_moe_mixedk_smem_n256_cb1(),
+    exl3_moe_mixedk_smem_n128_cb2(), exl3_moe_mixedk_smem_n256_cb2(),
+};
+
+int exl3_moe_mixedk_smem_instances_m32[] =
+{
+    exl3_moe_mixedk_smem_n128_cb2_m32()
+};
+
+int exl3_moe_mixedk_smem_instances_m64[] =
+{
+    exl3_moe_mixedk_smem_n128_cb2_m64()
+};
+
 void exl3_moe_mixedk
 (
     const at::Tensor& hidden_state,
@@ -672,29 +692,39 @@ void exl3_moe_mixedk
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
     fp_exl3_moe_mixedk_kernel kernel;
+    int smem_bytes = 0;
     if (m_tile <= 16 && cb_idx == 1 && k_max <= 2)
     {
         kernel = (k_max <= 1) ? exl3_moe_mixedk_kernel_n256_cb2_k1()
                               : exl3_moe_mixedk_kernel_n128_cb2_k2();
+        smem_bytes = (k_max <= 1) ? exl3_moe_mixedk_smem_n256_cb2_k1()
+                                  : exl3_moe_mixedk_smem_n128_cb2_k2();
     }
     else if (m_tile <= 16 && cb_idx == 1 && N_off == 1 && k_max <= 4)
     {
         kernel = exl3_moe_mixedk_kernel_n256_cb2_k4();
+        smem_bytes = exl3_moe_mixedk_smem_n256_cb2_k4();
     }
     else if (m_tile <= 16)
     {
         kernel = exl3_moe_mixedk_kernel_instances[2 * cb_idx + N_off];
+        smem_bytes = exl3_moe_mixedk_smem_instances[2 * cb_idx + N_off];
     }
     else
     {
         TORCH_CHECK(cb_idx == 1, "exl3_moe_mixedk: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe_mixedk: temp buffers hold fewer rows than the tile");
         kernel = m_tile >= 64 ? exl3_moe_mixedk_kernel_instances_m64[0] : exl3_moe_mixedk_kernel_instances_m32[0];
+        smem_bytes = m_tile >= 64 ? exl3_moe_mixedk_smem_instances_m64[0] : exl3_moe_mixedk_smem_instances_m32[0];
     }
+    TORCH_CHECK(smem_bytes > 0 && smem_bytes <= SMEM_MAX,
+                "exl3_moe_mixedk: instance shared memory out of range");
 
+    // The attribute is per-function; key it on (kernel, size) so a stale SMEM_MAX-sized
+    // opt-in from an earlier build cannot linger.
     if (moe_mixedk_kernel_attr_set[device].find((void*) kernel) == moe_mixedk_kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         moe_mixedk_kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
@@ -769,7 +799,7 @@ void exl3_moe_mixedk
         grid_dim,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        smem_bytes,
         stream
     );
 

@@ -22,6 +22,44 @@
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
 #endif
 
+// Exact dynamic shared-memory footprint of one mixed-K CTA, in bytes.
+//
+// This mirrors the layout in exl3_gemm_inner.cuh exactly:
+//
+//   extern __shared__ half shared[];
+//   half*     sh_a = shared;                                     SH * sh_a_stage_size
+//   uint16_t* sh_b = (uint16_t*) (sh_a + SH * sh_a_stage_size);   SH * sh_b_stage_size
+//   float*    sh_c = (float*)    (sh_b + SH * sh_b_stage_size);   sh_c_size
+//
+// sh_a/sh_b are ring buffers indexed by (slice_iters % SH); sh_c is a single buffer
+// (the MoE path passes shmem_out_had = false, and at MOE_TILESIZE_K == 16
+// TILEBLOCKS_K == 1 so threadblock_reduce() compiles to nothing). The three extents
+// below are therefore the entire reachable range, and the launcher requests exactly
+// this many bytes instead of SMEM_MAX. MAXBITS (not the launch's K) sets the sh_b
+// extent because one instance serves every K <= MAXBITS at run time.
+#ifndef MOE_A_STAGE_WARPS
+#define MOE_A_STAGE_WARPS 8
+#endif
+
+constexpr int moe_smem_bytes(int TILESIZE_N, int TILESIZE_M, int TILESIZE_K, int bits, int SH)
+{
+    const int TILEBLOCKS_K = TILESIZE_K / 16;
+    const int TILEBLOCKS_N = TILESIZE_N / 16;
+    const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
+    // The ring predicate lives here and only here, so every accessor, the launcher and the
+    // in-kernel static_assert agree by construction (a separate predicate argument that a
+    // call site forgets would request 29 184 B for a 47 104 B layout).
+    const int sh_a_stage_size = TILESIZE_M * TILESIZE_K
+        * (((TILESIZE_M == 16) && (TILESIZE_K == 16) && (TILEBLOCKS_N * bits <= 128))
+               ? MOE_A_STAGE_WARPS : 1);                                          // halfs
+    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;    // uint16s
+    const int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP * (TILESIZE_M / 16); // floats
+    return SH * sh_a_stage_size * 2 + SH * sh_b_stage_size * 2 + sh_c_size * 4;
+}
+
+#define MOE_SMEM_BYTES(N_TILE, M_TILE, MAXBITS, SH) \
+    moe_smem_bytes(N_TILE, M_TILE, MOE_TILESIZE_K, MAXBITS, SH)
+
 #define EXL3_MOE_KERNEL_ARGS                    \
     const half* __restrict__ hidden_state,      \
     half* __restrict__ temp_state_g,            \
