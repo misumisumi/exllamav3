@@ -19,6 +19,34 @@
 // the per-device value (DevCtx::get_smem_request), which is this capped by the device's limit
 #define SMEM_MAX EXL3_SMEM_MAX_DEFAULT
 
+// Private A stage rings (CUDA MMA inner only). 1 = one CTA-shared A tile per stage, i.e. the
+// classic two-__syncthreads-per-slice pipeline; NWARPS = one private tile per warp, which is what
+// makes the A/B pipeline barrier-free (cp.async.wait_group + __syncwarp() is then the whole
+// fence). The tile is 16x16 halfs and a warp's ldmatrix x4 reads all of it, so "per-warp
+// ownership" means replicating it, not partitioning it: 5 stages x 8 warps x 512 B = 20 KiB, and
+// each warp still issues exactly one predicated 16 B cp.async per lane per stage.
+#ifndef EXL3_GEMM_A_STAGE_WARPS
+#define EXL3_GEMM_A_STAGE_WARPS 8
+#endif
+
+// The ring exists only where a warp's B share fits in 32 lanes: 32*TILEBLOCKS_N*bits/16 int4 per
+// warp, i.e. (N/16)*bits <= 128. Every MoE decode tile takes it; the 16x32x256 dense tile (40
+// int4) and the 16x16x512 wide tile (64 int4) keep the CTA-shared A tile and their
+// __syncthreads(). This predicate is the only place the decision is made: exl3_gemm_smem_bytes()
+// below and the kernel's ring layout both call it, so the launch extent and the in-kernel layout
+// cannot disagree.
+constexpr int exl3_gemm_a_warps(int tilesize_m, int tilesize_k, int tilesize_n, int bits)
+{
+#if defined(USE_ROCM)
+    // RDNA inner: no cp.async pipeline to make private, so it always stages one shared A tile
+    (void) tilesize_m; (void) tilesize_k; (void) tilesize_n; (void) bits;
+    return 1;
+#else
+    return (tilesize_m == 16 && tilesize_k == 16 && (tilesize_n / 16) * bits <= 128)
+               ? EXL3_GEMM_A_STAGE_WARPS : 1;
+#endif
+}
+
 int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool multi);
 int exl3_gemm_num_kernel_shapes();
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits, bool half_k = false);
@@ -192,7 +220,10 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes(
     return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 2 * sh_b_dq_size + 4 * sh_c_size;
 #else
     int frags_n_per_warp = 2 * tileblocks_n / num_warps;
-    int sh_a_stage_size = tilesize_m * tilesize_k;                             // halfs
+    // Per-warp A rings where the shape takes them (exl3_gemm_a_warps): stage-major, warp-minor.
+    // 1 reproduces the single CTA-shared tile, so this is a strict generalisation.
+    int a_warps = exl3_gemm_a_warps(tilesize_m, tilesize_k, tilesize_n, bits);
+    int sh_a_stage_size = tilesize_m * tilesize_k * a_warps;                   // halfs
     int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp * tileblocks_m;   // floats
     if (sh_c_had > sh_c_size) sh_c_size = sh_c_had;
     return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;

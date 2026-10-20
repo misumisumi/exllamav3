@@ -706,30 +706,12 @@ void exl3_moe_gather
 #include "comp_units/exl3_moe_mixedk_instances.cuh"
 
 // ---- Mixed-K launch tuning -------------------------------------------------------------
-// Dynamic shared memory a mixedk instance actually needs, mirroring the layout in
-// exl3_gemm_inner.cuh: SH_STAGES x (A stage + B stage) + the C / cross-block reduction
-// staging. The generic path requests SMEM_MAX (90 KB) for every shape, which on sm_121
-// (100 KB smem/SM, smem/block_optin 99 KB) caps occupancy at ONE 512-thread block per SM;
-// asking for the real footprint admits two blocks per SM and doubles the memory-level
-// parallelism the kernel can keep in flight. K is a runtime value here, so size for the
-// widest case (K = 8). EXL3_MK_SMEM overrides the result for sweeps.
-//
-// sh_c bounds: the reduction buffer (FRAGS_N_PER_WARP * 4 floats per thread, t < 256 ->
-// 2048 floats at TILEBLOCKS_M == 1), the C staging in write_sum_tile_sh and the pre-hadamard
-// input (row * TILESIZE_N + col * 128 + 128 <= 2048 floats). 2x the exact requirement is used.
-static size_t exl3_moe_mixedk_smem_bytes(int m_tile, int n_tile, int bits, int sh_stages)
-{
-    const int tileblocks_m = m_tile / 16;
-    const int tileblocks_k = MOE_TILESIZE_K / 16;
-    const int tileblocks_n = n_tile / 16;
-    const size_t sh_a = (size_t) m_tile * MOE_TILESIZE_K * 2;                                  // halfs -> bytes
-    const size_t sh_b = (size_t) tileblocks_k * tileblocks_n * (256 / 16) * bits * 2;           // uint16s -> bytes
-    const int frags_n_per_warp = 2 * tileblocks_n / (EXL3_GEMM_BASE_THREADS / 32);
-    const size_t sh_c = (size_t) MAX(4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp * tileblocks_m,
-                                     n_tile * m_tile);                                          // floats
-    return (size_t) sh_stages * (sh_a + sh_b) + 2 * 4 * sh_c;
-}
-
+// The dynamic shared memory a mixedk instance needs is not a second formula: it is
+// moe_smem_bytes() (-> exl3_gemm_smem_bytes() with shmem_out_had = false), i.e. exactly the
+// layout exl3_gemm_kernel_inner static_asserts against, evaluated at the instance's own
+// (N, M, MAXBITS, SH). The launcher asks for that number rather than SMEM_MAX (90 KB): on
+// sm_121 (100 KB smem/SM, smem/block_optin 99 KB) 90 KB caps occupancy at ONE 512-thread
+// block per SM, while the real k4 footprint is 47 104 B. EXL3_MK_SMEM overrides it for sweeps.
 static int exl3_moe_env_int(const char* name, int def)
 {
     const char* v = getenv(name);
@@ -757,7 +739,7 @@ static bool exl3_moe_groups_ok(size_t concurrency, int target_blocks)
 
 static bool exl3_moe_mixedk_debug_done = false;
 
-std::set<void*> moe_mixedk_kernel_attr_set[MAX_DEVICES] = {};
+std::set<std::pair<void*, size_t>> moe_mixedk_kernel_attr_set[MAX_DEVICES] = {};
 
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances[] =
 {
@@ -775,6 +757,11 @@ fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_sh[] =
 };
 static const int exl3_moe_mixedk_kernel_sh_stages[] = { 4, 6 };
 static const int exl3_moe_mixedk_kernel_sh_frag[] = { 3, 5 };
+static const int exl3_moe_mixedk_smem_instances_sh[] =
+{
+    exl3_moe_mixedk_smem_n128_cb2_sh4fs3(),
+    exl3_moe_mixedk_smem_n128_cb2_sh6fs5()
+};
 
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m32[] =
 {
@@ -784,6 +771,26 @@ fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m32[] =
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m64[] =
 {
     exl3_moe_mixedk_kernel_n128_cb2_m64()
+};
+
+// Dynamic shared memory each instance actually indexes, in bytes (see moe_smem_bytes).
+// Requested verbatim at launch: SMEM_MAX (90 KiB) is 3x what any tk16 shape needs and
+// is what stops a second CTA from being resident on a 100 KiB/SM part.
+static const int exl3_moe_mixedk_smem_instances[] =
+{
+    // [cb_idx * 2 + N_off]
+    exl3_moe_mixedk_smem_n128_cb1(), exl3_moe_mixedk_smem_n256_cb1(),
+    exl3_moe_mixedk_smem_n128_cb2(), exl3_moe_mixedk_smem_n256_cb2(),
+};
+
+static const int exl3_moe_mixedk_smem_instances_m32[] =
+{
+    exl3_moe_mixedk_smem_n128_cb2_m32()
+};
+
+static const int exl3_moe_mixedk_smem_instances_m64[] =
+{
+    exl3_moe_mixedk_smem_n128_cb2_m64()
 };
 
 void exl3_moe_mixedk
@@ -946,38 +953,39 @@ void exl3_moe_mixedk
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
     fp_exl3_moe_mixedk_kernel kernel;
-    const int eff_m_tile = m_tile <= 16 ? 16 : (m_tile >= 64 ? 64 : 32);
-    // Shape the dynamic smem request below is derived from: the low-K instances carry fewer
-    // live bits bodies, so their stage size is smaller than the general (K = 8) one
-    int bits_used = 8;
-    int n_tile_used = N_off ? 256 : 128;
+    // Dynamic shared memory the selected instance indexes, in bytes -- one entry per branch,
+    // each moe_smem_bytes() at that instance's own (N, M, MAXBITS, SH), i.e. the same
+    // expression the kernel static_asserts its layout against. Keeping it next to the kernel
+    // choice is what makes "the launcher asks for the instance's true footprint" checkable.
+    int smem_bytes = 0;
+    int sh_stages_used = MOE_SH_STAGES;
+    int fs_used = MOE_FRAG_STAGES;
     if (m_tile <= 16 && cb_idx == 1 && k_max <= 2)
     {
         kernel = (k_max <= 1) ? exl3_moe_mixedk_kernel_n256_cb2_k1()
                               : exl3_moe_mixedk_kernel_n128_cb2_k2();
-        bits_used = k_max;
-        n_tile_used = (k_max <= 1) ? 256 : 128;
+        smem_bytes = (k_max <= 1) ? exl3_moe_mixedk_smem_n256_cb2_k1()
+                                  : exl3_moe_mixedk_smem_n128_cb2_k2();
     }
     else if (m_tile <= 16 && cb_idx == 1 && N_off == 1 && k_max <= 4)
     {
         kernel = exl3_moe_mixedk_kernel_n256_cb2_k4();
-        bits_used = 4;
-        n_tile_used = 256;
+        smem_bytes = exl3_moe_mixedk_smem_n256_cb2_k4();      // 47 104 B
     }
     else if (m_tile <= 16)
     {
         kernel = exl3_moe_mixedk_kernel_instances[2 * cb_idx + N_off];
+        smem_bytes = exl3_moe_mixedk_smem_instances[2 * cb_idx + N_off];
     }
     else
     {
         TORCH_CHECK(cb_idx == 1, "exl3_moe_mixedk: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe_mixedk: temp buffers hold fewer rows than the tile");
         kernel = m_tile >= 64 ? exl3_moe_mixedk_kernel_instances_m64[0] : exl3_moe_mixedk_kernel_instances_m32[0];
+        smem_bytes = m_tile >= 64 ? exl3_moe_mixedk_smem_instances_m64[0] : exl3_moe_mixedk_smem_instances_m32[0];
     }
 
     // Deeper-pipeline instance selection (m16 / n128 / mul1 only, EXL3_MK_SHPIPE = 43 or 65)
-    int sh_stages_used = MOE_SH_STAGES;
-    int fs_used = MOE_FRAG_STAGES;
     int pipe_sel = exl3_moe_env_int("EXL3_MK_SHPIPE", 0);
     if (pipe_sel != 0 && cb_idx == 1 && N_off == 0 && m_tile <= 16)
     {
@@ -987,31 +995,37 @@ void exl3_moe_mixedk
             kernel = exl3_moe_mixedk_kernel_instances_sh[idx];
             sh_stages_used = exl3_moe_mixedk_kernel_sh_stages[idx];
             fs_used = exl3_moe_mixedk_kernel_sh_frag[idx];
-            bits_used = 8;
-            n_tile_used = 128;
+            smem_bytes = exl3_moe_mixedk_smem_instances_sh[idx];
         }
     }
 
-    // Size the dynamic smem to the shape instead of always reserving SMEM_MAX
-    size_t smem_bytes = exl3_moe_mixedk_smem_bytes(eff_m_tile, n_tile_used, bits_used, sh_stages_used);
+    // #325's per-device budget: what the driver will actually grant one block (Turing 64 KB,
+    // sm_86 99 KB, sm_121 99 KB), capped at the SMEM_MAX the kernels are written against. The
+    // gate is on the instance's real footprint, so a shape that needs 47 104 B is neither
+    // rejected nor over-reserved
+    const int smem_max = DevCtx::instance().get_smem_request(device);
+    TORCH_CHECK(smem_bytes > 0, "exl3_moe_mixedk: instance has no shared-memory record");
+    TORCH_CHECK(smem_bytes <= smem_max,
+                "exl3_moe_mixedk: instance needs ", smem_bytes,
+                " B of shared memory, device provides ", smem_max);
     int smem_override = exl3_moe_env_int("EXL3_MK_SMEM", 0);
-    if (smem_override > 0) smem_bytes = (size_t) smem_override;
-    smem_bytes = MIN(smem_bytes, (size_t) SMEM_MAX);
-    smem_bytes = MAX(smem_bytes, (size_t) 4096);
+    if (smem_override > 0) smem_bytes = MIN(smem_override, smem_max);
 
     if (exl3_moe_env_int("EXL3_MK_DEBUG", 0) && !exl3_moe_mixedk_debug_done)
     {
         exl3_moe_mixedk_debug_done = true;
-        printf(" -- mixedk launch: grid=(%d,1,%d) block=%d smem=%zu (SMEM_MAX=%d) bps=%d active=%d mtile=%d N_off=%d SH=%d FS=%d\n",
-               group_size, num_groups, block_dim, smem_bytes, SMEM_MAX, blocks_per_sm,
-               num_active, eff_m_tile, N_off, sh_stages_used, fs_used);
+        printf(" -- mixedk launch: grid=(%d,1,%d) block=%d smem=%d (SMEM_MAX=%d dev=%d) bps=%d active=%d mtile=%d N_off=%d SH=%d FS=%d\n",
+               group_size, num_groups, block_dim, smem_bytes, SMEM_MAX, smem_max, blocks_per_sm,
+               num_active, m_tile, N_off, sh_stages_used, fs_used);
         fflush(stdout);
     }
 
-    if (moe_mixedk_kernel_attr_set[device].find((void*) kernel) == moe_mixedk_kernel_attr_set[device].end())
+    // The attribute is per-function; key it on (kernel, size) so a stale SMEM_MAX-sized
+    // opt-in from an earlier build cannot linger.
+    if (moe_mixedk_kernel_attr_set[device].find({ (void*) kernel, (size_t) smem_bytes }) == moe_mixedk_kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-        moe_mixedk_kernel_attr_set[device].insert((void*) kernel);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        moe_mixedk_kernel_attr_set[device].insert({ (void*) kernel, (size_t) smem_bytes });
         cuda_check(cudaPeekAtLastError());
     }
 

@@ -2,9 +2,41 @@
 
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
-// EXL3_GEMM_BASE_THREADS, SMEM_MAX and exl3_gemm_smem_bytes(), the shared definition of this kernel's
-// shared memory footprint
+// EXL3_GEMM_BASE_THREADS, SMEM_MAX, exl3_gemm_a_warps() and exl3_gemm_smem_bytes(), the shared
+// definition of this kernel's shared memory footprint
 #include "exl3_kernel_map.cuh"
+
+// Barriers per slice in the shared-memory pipeline.
+//
+// 2 (shipping) does two __syncthreads() per slice:
+//     async_load_gl(); cp_async_wait; __syncthreads(); matmul; ...; load_frags(); __syncthreads();
+//     (a) after the wait, so every warp sees the stage bytes another warp copied;
+//     (b) after load_frags, so no warp overwrites the stage slot before every warp has
+//         finished reading it.
+//
+// 1 (EXL3_GEMM_PIPE_BARRIERS == 1) keeps the load where it is and moves barrier (a) to between
+// matmul and load_frags, dropping (b). With SH stages, iteration k writes slot
+// s0(k) = (L-4-k) mod SH and reads s1(k) = (L-1-k) mod SH, so s0(k) == s1(k-3): the
+// single barrier at iteration k sits after every read of that slot (three iterations
+// earlier) and before the read of s1(k), which is what barrier (a) bought. Nothing is
+// reordered, no byte moves differently, and no arithmetic changes -- the barrier count is
+// the only delta.
+//
+// 0 (warp-private stages) removes the pipeline barrier entirely, which is sound only because the
+// stage is then warp-private: every warp stages the A bytes and the B bytes it later reads
+// (EXL3_GEMM_A_STAGE_WARPS private A tiles + per-warp B ownership in async_load_gl), so
+// visibility and write-after-read are both warp-local and cp.async.wait_group +
+// __syncwarp() is the whole requirement. The only CTA-wide barriers left in the slice loop
+// are the two in the column reduction (barrier_acquire / barrier_release), which guard
+// genuinely shared data: frag_c handed off through global memory between CTAs.
+//
+// A_WARPS == 1 shapes (the wide 16x16x512 and the k-split 16x32 dense tiles) never take mode 0
+// unguarded: the __syncwarp() below is emitted as __syncthreads() for them, so mode 0 is a strict
+// generalisation of mode 2.
+#ifndef EXL3_GEMM_PIPE_BARRIERS
+#define EXL3_GEMM_PIPE_BARRIERS 0
+#endif
+
 
 // On GA10x, HMMA with fp32 accumulation runs at half rate and dominates the m=1 (decode-bound) case.
 // Accumulate MMA results in fp16 instead and fold into the fp32 accumulators once per k-slice: ~14%
@@ -48,8 +80,11 @@ void exl3_gemm_kernel_inner
     const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
 
     constexpr int TILE_U16 = 16 * bits + (half_k ? 8 : 0);                        // uint16 per 16x16 tile
-    const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                         // in halfs
-    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * TILE_U16;   // in uint16s
+    // Per-warp A rings: stage-major, warp-minor. With A_WARPS == 1 the ring degenerates
+    // to the one CTA-shared tile and the warp stride below is 0.
+    const int A_WARPS = exl3_gemm_a_warps(TILESIZE_M, TILESIZE_K, TILESIZE_N, bits);
+    const int sh_a_stage_size = TILESIZE_M * TILESIZE_K * A_WARPS;               // in halfs
+    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * TILE_U16;          // in uint16s
     const int sh_c_size = MAX  // in floats
     (
         4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP * TILEBLOCKS_M,
@@ -91,6 +126,18 @@ void exl3_gemm_kernel_inner
     half* sh_a = shared;
     uint16_t* sh_b = (uint16_t*) (sh_a + SH_STAGES * sh_a_stage_size);
     float* sh_c = (float*) (sh_b + sh_b_stage_size * SH_STAGES);
+    // __shared__ is not constexpr, so the pointer identities above can only be checked at
+    // run time. Build with -DEXL3_GEMM_SMEM_BOUND_ASSERT to make every CTA check, on entry, that
+    // the extent it was launched with equals the extent the layout formula claims.
+    #ifdef EXL3_GEMM_SMEM_BOUND_ASSERT
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z == 0)
+        {
+            size_t laid_out = (size_t) ((const char*) (sh_c + sh_c_size) - (const char*) shared);
+            if (laid_out != (size_t) exl3_gemm_smem_bytes(TILESIZE_M, TILESIZE_K, TILESIZE_N,
+                                                          SH_STAGES, FRAG_STAGES, bits, half_k,
+                                                          shmem_out_had)) __trap();
+        }
+    #endif
 
     // Thread index
     int t = threadIdx.x % EXL3_GEMM_BASE_THREADS;
@@ -131,16 +178,28 @@ void exl3_gemm_kernel_inner
     const int gl_a_stride_k = TILESIZE_K;
     const int sh0_a_stride_m = TILESIZE_M * TILESIZE_K;
     const half* gl_a_ptr = A + slice_m * gl_a_stride_m + slice0_k * gl_a_stride_k;
-    half* sh0_a_ptr = sh_a + (slice0_iters % SH_STAGES) * sh_a_stage_size;
 
-    const int load_a_iters = CEIL_DIVIDE(sh0_a_stride_m / 8, EXL3_GEMM_BASE_THREADS);
+    // Warp w's private tile lives at warp w's slot. The base is a *named* term that both
+    // the init site and advance0()/advance1() add: applying it at the init sites only makes
+    // every later stage of the ring alias warp 0's slot, and the A reads then race with the
+    // other warps' copies.
+    const int sh_a_warp_stride = (A_WARPS > 1) ? TILESIZE_M * TILESIZE_K : 0;
+    half* sh_a_warp_base = sh_a + warp_id * sh_a_warp_stride;
+    half* sh0_a_ptr = sh_a_warp_base + (slice0_iters % SH_STAGES) * sh_a_stage_size;
+
+    // A lane count: 32 lanes of every warp cover the whole tile (TILESIZE_M rows x
+    // TILEBLOCKS_K int4 columns), so the same index vector is replayed by all NWARPS
+    // warps. With A_WARPS == 1 this is C's CTA-wide walk.
+    constexpr int A_LANES = (A_WARPS > 1) ? 32 : EXL3_GEMM_BASE_THREADS;
+    const int at = (A_WARPS > 1) ? lane_id : t;
+    const int load_a_iters = CEIL_DIVIDE(sh0_a_stride_m / 8, A_LANES);
     bool pred_a_gl[load_a_iters];
     int load_a_gl[load_a_iters];
     int load_a_sh[load_a_iters];
     for (int i = 0; i < load_a_iters; ++i)
     {
-        int k = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_a_stride_k / 8);
-        int m = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_a_stride_k / 8);
+        int k = (i * A_LANES + at) % (gl_a_stride_k / 8);
+        int m = (i * A_LANES + at) / (gl_a_stride_k / 8);
         load_a_gl[i] = m * size_k / 8 + k;
         load_a_sh[i] = m * A_COLS + (k ^ ((m >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK));
         pred_a_gl[i] = m < size_m;
@@ -169,7 +228,7 @@ void exl3_gemm_kernel_inner
         slice0_iters--;
 
         int stage = slice0_iters % SH_STAGES;
-        sh0_a_ptr = sh_a + stage * sh_a_stage_size;
+        sh0_a_ptr = sh_a_warp_base + stage * sh_a_stage_size;
         sh0_b_ptr = sh_b + stage * sh_b_stage_size;
 
         if (slice0_k >= tiles_k)
@@ -191,7 +250,7 @@ void exl3_gemm_kernel_inner
     int slice1_n = slice0_n;
     int slice1_iters = slice0_iters;
 
-    half* sh1_a_ptr = sh_a + (slice1_iters % SH_STAGES) * sh_a_stage_size;
+    half* sh1_a_ptr = sh_a_warp_base + (slice1_iters % SH_STAGES) * sh_a_stage_size;
     uint16_t* sh1_b_ptr = sh_b + (slice1_iters % SH_STAGES) * sh_b_stage_size;
 
     auto advance1 = [&] ()
@@ -200,7 +259,7 @@ void exl3_gemm_kernel_inner
         slice1_iters--;
 
         int stage = slice1_iters % SH_STAGES;
-        sh1_a_ptr = sh_a + stage * sh_a_stage_size;
+        sh1_a_ptr = sh_a_warp_base + stage * sh_a_stage_size;
         sh1_b_ptr = sh_b + stage * sh_b_stage_size;
 
         if (slice1_k >= tiles_k)
@@ -271,7 +330,37 @@ void exl3_gemm_kernel_inner
                 }
             }
 
-            // Copy tile of 256-element blocks from quantized B matrix
+            // Per-warp B ownership: warp w copies exactly the bytes load_frags() will
+            // dq_dispatch() -- the two 16-column groups sub_n2 = 2w and 2w+1, i.e. stage
+            // bytes [64*bits*w, 64*bits*(w+1)). 4*bits lanes of 16 B cover it, so the
+            // stage is still walked contiguously and 16 B at a time, and the set of
+            // (smem <- global) address pairs is bit-for-bit the C build's; only the
+            // issuing warp changes.
+            if constexpr (A_WARPS > 1)
+            {
+                const int4* gl = (const int4*) gl_b_ptr;
+                int4* sh = (int4*) sh0_b_ptr;
+                constexpr int b_warp_int4 = TILEBLOCKS_K * TILEBLOCKS_N * bits / 4;  // 16 B words
+                static_assert(b_warp_int4 <= 32, "B stage does not divide into 32-lane warp shares");
+                const int bt = warp_id * b_warp_int4 + lane_id;
+                if constexpr (TILEBLOCKS_K == 1)
+                {
+                    // (k,n) flattening is the identity inside one k-tile row, which is
+                    // every instantiated MoE shape (TILESIZE_K == 16 => TILEBLOCKS_K == 1).
+                    if (lane_id < b_warp_int4) cp_async(sh + bt, gl + bt);
+                }
+                else
+                {
+                    const int b_n_int4 = gl_b_stride_n / 8;
+                    const int b_k_int4 = blocks_n_full * TILE_U16 / 8;
+                    if (lane_id < b_warp_int4)
+                        cp_async(sh + bt, gl + (bt / b_n_int4) * b_k_int4 + (bt % b_n_int4));
+                }
+            }
+
+            // CTA-shared copy (the C build): 32*bits consecutive lanes of the CTA walk the
+            // stage, so warp w copies bytes warps 2w/2w+1 read -- hence a barrier.
+            if constexpr (A_WARPS == 1)
             {
                 const int4* gl = (const int4*) gl_b_ptr;
                 int4* sh = (int4*) sh0_b_ptr;
@@ -319,7 +408,7 @@ void exl3_gemm_kernel_inner
             dq_dispatch<bits, cb, half_k>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 
-        __syncthreads();
+        if constexpr (EXL3_GEMM_PIPE_BARRIERS == 2) __syncthreads();
         advance1();
     };
 
@@ -889,7 +978,17 @@ void exl3_gemm_kernel_inner
     auto wait_stage = [&] ()
     {
         cp_async_wait<SH_STAGES - 2>();
-        __syncthreads();
+        if constexpr (A_WARPS > 1)
+        {
+            // Warp-private stages: wait_group makes the issuing lane's cp.async writes
+            // visible to that lane, __syncwarp() orders them before the other 31 lanes'
+            // reads of the same 16 B words. No other warp touches these bytes.
+            __syncwarp();
+        }
+        else
+        {
+            __syncthreads();
+        }
     };
 
     // Perform tensor core matmul on current tile
@@ -938,9 +1037,28 @@ void exl3_gemm_kernel_inner
     // dequantization overhead, but we need two different iterations of the main loop to avoid confusing the compiler
     // and making it (sometimes) place the fragment arrays in local memory
 
+    // EXL3_GEMM_PIPE_BARRIERS == 2: wait_stage() carries barrier (a), load_frags() carries (b).
+    // EXL3_GEMM_PIPE_BARRIERS == 1: only cp_async_wait here; the single barrier sits just before
+    // load_frags (see the knob at the top of this file).
+    // EXL3_GEMM_PIPE_BARRIERS == 0: warp-local only -- cp_async_wait + __syncwarp, no bar.sync.
+    #if EXL3_GEMM_PIPE_BARRIERS == 2
+    #define PIPE_WAIT() wait_stage()
+    #define PIPE_BARRIER_BEFORE_FRAGS()
+    #elif EXL3_GEMM_PIPE_BARRIERS == 1
+    #define PIPE_WAIT() cp_async_wait<SH_STAGES - 2>()
+    #define PIPE_BARRIER_BEFORE_FRAGS() __syncthreads()
+    #else
+    // Warp-private stages (A_WARPS > 1): __syncwarp is the whole fence. The dense/wide
+    // 16-row tiles fall back to C's CTA barrier, so mode 0 is a strict generalisation.
+    #define PIPE_WAIT() cp_async_wait<SH_STAGES - 2>()
+    #define PIPE_BARRIER_BEFORE_FRAGS() \
+        do { if constexpr (A_WARPS > 1) __syncwarp(); else __syncthreads(); } while (0)
+    #endif
+
     #define FSTAGE_OLD(_load, _mul) \
         async_load_gl(); \
-        wait_stage(); \
+        PIPE_WAIT(); \
+        PIPE_BARRIER_BEFORE_FRAGS(); \
         load_frags(_load); \
         matmul(_mul); \
         if (slice2_k == tiles_k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
@@ -949,11 +1067,12 @@ void exl3_gemm_kernel_inner
 
     #define FSTAGE(_load, _mul) \
         async_load_gl(); \
-        wait_stage(); \
+        PIPE_WAIT(); \
         matmul(_mul); \
         if (slice2_k == tiles_k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
         advance2(); \
         if (!slice2_iters) break; \
+        PIPE_BARRIER_BEFORE_FRAGS(); \
         load_frags(_load); \
 
     if constexpr (FRAG_STAGES == 1)
