@@ -6,6 +6,10 @@
 // Non-gated relu2 (NemotronH): the g input is unused (its GEMM is skipped by the caller); the
 // gate lane is set to relu(u) so the gate multiply below yields relu(u) * u = relu^2(u) exactly
 #define ACT_RELU2_NOGATE 2
+// Clamped SwiGLU-OAI (gpt-oss / MiniMax-M3): the activation consumes BOTH lanes (the up
+// lane is clamped symmetrically and shifted by +1 inside the activation), so the generic
+// clamp + gate multiply below must be skipped for this index
+#define ACT_SILU_OAI 3
 
 // Hadamard transform 128-element vector across one warp, with optional pre and post scales
 
@@ -340,6 +344,22 @@ void had_hf_r_128_guad_inner
         return __float22half2_rn(xf);
     };
 
+    // Clamped SwiGLU-OAI, fp32 form (activation_kernels.cuh cannot be included twice:
+    // activation.cu already includes it, so -- as exl3_moe_coop_kernel.cuh does with
+    // act_oai_swiglu -- the fp32 math is restated here). Gate clamped from above only,
+    // up clamped symmetrically, both BEFORE the activation, alpha 1.702 inside the
+    // sigmoid and +1 on the up path: identical to the qualified coop kernel instance.
+    auto _oai_swiglu = [&](float g, float u)
+    {
+        if (act_limit != 0.0f)
+        {
+            g = fminf(g, act_limit);
+            u = fminf(fmaxf(u, -act_limit), act_limit);
+        }
+        float glu = g * (1.0f / (1.0f + __expf(-1.702f * g)));
+        return (u + 1.0f) * glu;
+    };
+
     // Load. In non-gated mode the g buffer holds no data (its GEMM is skipped); the gate lane
     // is synthesized from u in the activation switch below
     half4 vg = {};
@@ -381,24 +401,46 @@ void had_hf_r_128_guad_inner
             vg.y = __hmax2(vu.y, __float2half2_rn(0.0f));
             break;
 
+        case ACT_SILU_OAI:
+        {
+            // Both lanes are consumed here: the up clamp and the (up + 1) shift are
+            // part of the activation, so the generic clamp + gate multiply below
+            // must not run for this index (it would re-clamp the already-activated
+            // product and multiply by the raw up lane a second time).
+            float2 gx = __half22float2(vg.x);
+            float2 gy = __half22float2(vg.y);
+            float2 ux = __half22float2(vu.x);
+            float2 uy = __half22float2(vu.y);
+            gx.x = _oai_swiglu(gx.x, ux.x);
+            gx.y = _oai_swiglu(gx.y, ux.y);
+            gy.x = _oai_swiglu(gy.x, uy.x);
+            gy.y = _oai_swiglu(gy.y, uy.y);
+            vg.x = __float22half2_rn(gx);
+            vg.y = __float22half2_rn(gy);
+            break;
+        }
+
         default:
             break;
     }
 
-    // Optional activation limits
-    if (act_limit != 0.0f)
+    if (act_function != ACT_SILU_OAI)
     {
-        vu.x = __hmax2(vu.x, __float2half2_rn(-act_limit));
-        vu.y = __hmax2(vu.y, __float2half2_rn(-act_limit));
-        vu.x = __hmin2(vu.x, __float2half2_rn(act_limit));
-        vu.y = __hmin2(vu.y, __float2half2_rn(act_limit));
-        vg.x = __hmin2(vg.x, __float2half2_rn(act_limit));
-        vg.y = __hmin2(vg.y, __float2half2_rn(act_limit));
-    }
+        // Optional activation limits
+        if (act_limit != 0.0f)
+        {
+            vu.x = __hmax2(vu.x, __float2half2_rn(-act_limit));
+            vu.y = __hmax2(vu.y, __float2half2_rn(-act_limit));
+            vu.x = __hmin2(vu.x, __float2half2_rn(act_limit));
+            vu.y = __hmin2(vu.y, __float2half2_rn(act_limit));
+            vg.x = __hmin2(vg.x, __float2half2_rn(act_limit));
+            vg.y = __hmin2(vg.y, __float2half2_rn(act_limit));
+        }
 
-    // Gate
-    vg.x = __hmul2(vg.x, vu.x);
-    vg.y = __hmul2(vg.y, vu.y);
+        // Gate
+        vg.x = __hmul2(vg.x, vu.x);
+        vg.y = __hmul2(vg.y, vu.y);
+    }
 
     // Pre scale (d)
     half4 scales_d = ((half4*) pre_scale_d)[i];
