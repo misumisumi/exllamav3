@@ -1652,6 +1652,26 @@ def main(args, job_state):
             capture_H = None
             config.stc.close()
 
+        # Optional dense SAGE QAD: run *before* the quantized layer advances the
+        # student prefix. Actual module state and source reference outputs remain
+        # alive here. The caller opts in with SAGE_DENSE_INLINE_QAD=1; otherwise
+        # default encoder semantics remain completely unchanged.
+        if os.environ.get("SAGE_DENSE_INLINE_QAD") == "1" and re.fullmatch(r"model\.layers\.\d+", module.key):
+            if state is None or len(ref_states) < num_ref_states:
+                raise RuntimeError("SAGE dense QAD requires real calibration state and all 5 reference outputs")
+            if getattr(config, "architecture", "") != "LlamaForCausalLM":
+                raise RuntimeError("SAGE dense QAD supports only LlamaForCausalLM")
+            from sage_exl3.nanbeige_inline_qad import polish_encoded_block
+            q_tensors = polish_encoded_block(
+                module=module, config=config, q_tensors=q_tensors, state=state,
+                original_input_ids=original_input_ids, reference_states=ref_states,
+                bad_rows=bad_rows, source_dir=Path(args["in_dir"]),
+                run_dir=Path(args["work_dir"]) / "qad_receipts",
+                device=device, steps=int(os.environ.get("SAGE_DENSE_QAD_STEPS", "30")),
+                lr=float(os.environ.get("SAGE_DENSE_QAD_LR", "0.01")),
+                audit_all_weights=os.environ.get("SAGE_DENSE_COSINE", "1") == "1",
+            )
+
         # Save layer tensors to working directory
         clear_temp_files(args)
         save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
