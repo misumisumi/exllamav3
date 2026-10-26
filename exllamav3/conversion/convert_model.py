@@ -107,7 +107,12 @@ group.add_argument("--out_scales", type = str, default = "auto", choices = ["aut
 
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
 
-num_ref_states = 5
+# More same-prefix BF16 block references are necessary to learn a genuine
+# residual target while retaining two disjoint local QAD validation groups.
+# Never change production encoder behavior unless opt-in.
+num_ref_states = int(os.environ.get("SAGE_DENSE_REF_ROWS", "5"))
+if not 5 <= num_ref_states <= 32:
+    raise ValueError("SAGE_DENSE_REF_ROWS must be between 5 and 32")
 
 progress_lock = threading.Lock()
 curr_progress = 0
