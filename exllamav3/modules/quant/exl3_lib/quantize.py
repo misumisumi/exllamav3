@@ -1619,7 +1619,8 @@ def damping_share(quant_args: dict) -> float:
 
 
 def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, su: torch.Tensor, sv: torch.Tensor,
-                 rounds: int = 2, chunk: int = 16384, damping: float = 0.0):
+                 rounds: int = 2, chunk: int = 16384, damping: float = 0.0,
+                 stream_hw_to_cpu: bool | None = None):
     """
     Free post-quantization polish: refit the stored per-channel fp16 scales (suh on the input side, svh on
     the output side) to the quantized weight in the Hessian metric, holding the trellis fixed. With
@@ -1637,6 +1638,14 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         H_err.diagonal().sub_(d_off)
     else:
         H_err = H
+    # WSL/WDDM: very wide LM heads cause a transient residency failure when
+    # refit holds both Q and HW (multi-GiB each) on GPU, then allocates another
+    # full Q at Q = Q*c. Store only the Hessian product HW on the CPU for these
+    # very wide matrices; all numerical linear algebra still runs on CUDA.
+    # Small/block weights retain the original exact refit path.
+    large_head = weight_q.numel() >= 200_000_000 if stream_hw_to_cpu is None else stream_hw_to_cpu
+    if large_head:
+        chunk = min(chunk, 4096)
     W = weight if weight.device == dev else None      # large originals may sit on the CPU; stream columns
     def cols(x, a, b):
         return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
@@ -1645,13 +1654,15 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     su = su.float().to(dev).view(k, 1)
     sv = sv.float().to(dev).view(1, n)
     # H W once (streamed over columns), reused by both steps; den = trace(W H W^T)
-    HW = torch.empty((k, n), dtype = torch.float, device = dev)
+    HW = torch.empty((k, n), dtype = torch.float, device = "cpu" if large_head else dev)
     den = 0.0
     for a in range(0, n, chunk):
         b = min(a + chunk, n)
         wc = cols(weight, a, b)
-        HW[:, a:b] = H @ wc
-        den += (wc * HW[:, a:b]).sum().item()
+        hw = H @ wc
+        den += (wc * hw).sum().item()
+        HW[:, a:b] = hw.cpu() if large_head else hw
+        del hw
     den_err = den
     if H_err is not H:
         den_err = 0.0
@@ -1673,18 +1684,32 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             HQ = H @ Q[:, a:b]
-            num[a:b] = (Q[:, a:b] * HW[:, a:b]).sum(0)
+            hw = HW[:, a:b].to(dev) if large_head else HW[:, a:b]
+            num[a:b] = (Q[:, a:b] * hw).sum(0)
             dn[a:b] = (Q[:, a:b] * HQ).sum(0)
         c = torch.where(dn > 1e-30, num / dn.clamp(min = 1e-30), torch.ones_like(num))
-        Q = Q * c.view(1, n)
+        if large_head:
+            # Avoid allocating another full-size GPU Q; only the return is used.
+            Q.mul_(c.view(1, n))
+        else:
+            Q = Q * c.view(1, n)
         sv = sv * c.view(1, n)
         # input-side scales
         A = (Q @ Q.T) * H
-        b_ = (Q * HW).sum(1)
+        if large_head:
+            b_ = torch.zeros(k, dtype = Q.dtype, device = dev)
+            for a in range(0, n, chunk):
+                b = min(a + chunk, n)
+                b_.add_((Q[:, a:b] * HW[:, a:b].to(dev)).sum(1))
+        else:
+            b_ = (Q * HW).sum(1)
         A.diagonal().add_(1e-6 * A.diagonal().mean())
         r = torch.linalg.solve(A, b_)
         r = torch.where(torch.isfinite(r) & (r > 0), r, torch.ones_like(r))
-        Q = Q * r.view(k, 1)
+        if large_head:
+            Q.mul_(r.view(k, 1))
+        else:
+            Q = Q * r.view(k, 1)
         su = su * r.view(k, 1)
     e_after = err(Q)
     return Q, su, sv, e_before, e_after
