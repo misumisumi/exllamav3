@@ -34,11 +34,23 @@ class TableEmbedding:
         self.hidden_size = hidden_size
         self.device = device = torch.device(device)     # (TP ranks name their device by index)
         self.signs = signs
+        # Opt-in whole-table GPU residency for a *quantized* normal token embedding.
+        # The default RowTable path has CPU stores (or disk handles) and streams
+        # selected rows to CUDA; a model can fit in GPU VRAM while silently
+        # keeping its embedding weights on the host. This fork's opt-in option
+        # actually allocates the trellis on CUDA, preserving exactly the same
+        # byte-efficient packed representation and decode kernel. N-gram tables
+        # and streamed datasets are deliberately excluded.
+        self.cuda_trellis = None
         if signs is not None:
             self.groups = signs.shape[0]
             self.K = (table.row_words // self.groups - 1) // 16
             assert table.row_words == self.groups * (1 + 16 * self.K) and self.groups * GROUP_DIM >= hidden_size
             self.codebook = mul1_codebook(device) if device.type != "cuda" else None
+            if _os.environ.get("EXL3_EMBED_TABLE_CUDA", "0") == "1":
+                if device.type != "cuda" or table.on_disk or len(table.stores) != 1:
+                    raise RuntimeError("EXL3_EMBED_TABLE_CUDA requires one resident quantized table on CUDA")
+                self.cuda_trellis = table.stores[0].to(device, non_blocking = False).contiguous()
 
     def resolve(self, ids: torch.Tensor, pin) -> tuple:
         # Decode-sized lookups gather their rows as they come; chunks gather each row once
@@ -62,6 +74,15 @@ class TableEmbedding:
 
     def forward(self, ids: torch.Tensor, synced: bool = False) -> torch.Tensor:
         shape = ids.shape
+        if self.cuda_trellis is not None:
+            flat = ids.reshape(-1).to(self.device, dtype = torch.int64)
+            if flat.numel() == 0 or torch.any(flat < 0) or torch.any(flat >= self.table.num_rows):
+                raise ValueError("Input token ID outside GPU-resident quantized embedding table")
+            unique, inverse = torch.unique(flat, sorted = True, return_inverse = True)
+            trellis = self.cuda_trellis.index_select(0, unique)
+            decoded = self.decode(trellis, None, unique.numel())
+            out = decoded.index_select(0, inverse)
+            return out.view(*shape, self.hidden_size)
         ids = ids.to("cpu", torch.int64).contiguous()
         out = self.table.lookup(ids, ids.numel(), self.resolve, self.decode, self.device, synced)
         return out.view(*shape, self.hidden_size)
