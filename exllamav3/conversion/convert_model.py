@@ -1099,6 +1099,83 @@ def run_row_workers(title, num_rows, workers, progress_count):
         raise errors[0]
 
 
+# Row batching for the calibration forwards (--calib_batch_rows). Rows are independent sequences of equal
+# length, so stacking them along the batch dim gives the same per-row outputs, and the Hessian proxy is a
+# plain sum over tokens (only fp32 summation order differs). Reference rows, rows already excluded, and rows
+# carrying quant_preserve state keep the original one-row path.
+CALIB_BATCH = 1
+
+
+def _row_batchable(i, bad_rows, get_preserve):
+    if i < num_ref_states or i in bad_rows:
+        return False
+    p = {}
+    get_preserve(i, p)
+    return len(p) == 1 and not p.get("quant_preserve")
+
+
+def calib_chunks(rows, bad_rows, get_preserve, allow = True):
+    rows = list(rows)
+    n = CALIB_BATCH if allow else 1
+    pos = 0
+    while pos < len(rows):
+        i = rows[pos]
+        if n <= 1 or not _row_batchable(i, bad_rows, get_preserve):
+            yield "one", i
+            pos += 1
+            continue
+        chunk = []
+        while pos < len(rows) and len(chunk) < n and _row_batchable(rows[pos], bad_rows, get_preserve):
+            chunk.append(rows[pos])
+            pos += 1
+        if len(chunk) == 1:
+            yield "one", chunk[0]
+        else:
+            yield "batch", chunk
+
+
+def run_calib_chunks(rows, bad_rows, get_preserve, one, batch, allow = True):
+    batch_limit = CALIB_BATCH if allow else 1
+    for kind, item in calib_chunks(rows, bad_rows, get_preserve, allow):
+        if kind == "one":
+            one(item)
+            continue
+        pending = [item[i:i + batch_limit] for i in range(0, len(item), batch_limit)]
+        while pending:
+            chunk = pending.pop(0)
+            if len(chunk) == 1:
+                one(chunk[0])
+                continue
+            retry = False
+            try:
+                batch(chunk)
+            except torch.cuda.OutOfMemoryError:
+                batch_limit = max(1, len(chunk) // 2)
+                middle = len(chunk) // 2
+                pending[0:0] = [chunk[:middle], chunk[middle:]]
+                retry = True
+            if retry:
+                torch.cuda.empty_cache()
+
+
+def batch_input_ids(original_input_ids, chunk):
+    ids = [original_input_ids[i] for i in chunk]
+    return torch.stack(ids, 0) if ids[0].dim() == 1 else torch.cat(ids, 0)
+
+
+def batch_states(state, chunk):
+    xs = [state[i] for i in chunk]
+    dev = xs[0].device
+    xs = [x.to(dev) for x in xs]
+    return torch.stack(xs, 0) if xs[0].dim() == 2 else torch.cat(xs, 0)
+
+
+def unbatch_states(rs, chunk, state):
+    if state[chunk[0]].dim() == 2:
+        return [rs[j] for j in range(len(chunk))]
+    return [rs[j:j + 1] for j in range(len(chunk))]
+
+
 def capture_passes(module, devices, headroom_min = 1536 << 20, headroom_frac = 0.06):
     """
     Split a module's Hessian capture into passes whose block-packed fp32 Hessians fit beside the loaded weights on
