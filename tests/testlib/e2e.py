@@ -57,8 +57,11 @@ class LoadedModel:
             hybrid_draft_tokens = a.hybrid_draft_tokens,
             ngram_corpus = a.ngram_corpus,
             dynamic_draft_tokens = a.dynamic_draft,
+            sparse_draft_head = getattr(a, "sparse_draft_head", 0),
             draft_confidence = a.draft_confidence,
             cpu_cache_size = int(a.cpu_cache_size * 1024 ** 3),
+            disk_cache_dir = a.disk_cache_dir,
+            disk_cache_size = int(a.disk_cache_size * 1024 ** 3),
             recurrent_cache_size = int(a.recurrent_cache_size * 1024 ** 3),
         )
         opts.update(kwargs)

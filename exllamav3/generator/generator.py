@@ -1,17 +1,20 @@
 from __future__ import annotations
 import logging
 import torch
+import os
 from ..model.model import Model
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
+from ..ext import exllamav3_ext as ext
 
 logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
+from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
 from .filter import Filter
@@ -19,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
 import time
+from ..util.device_copy import to_device
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
@@ -27,13 +31,21 @@ import os as _os
 _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
 _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
 
+# Test hook: True forces the per-position serial speculative-window readback instead of the batched
+# (launch-all-samplers, one pinned stage, one synchronize) path
+_NO_BATCH_READBACK = False
+
 
 def _dflash_layout(tensor: torch.Tensor, sample_from_anchor: bool) -> torch.Tensor:
     """Align sampled IDs or confidence columns with verifier draft positions."""
     return tensor if sample_from_anchor else tensor[:, 1:]
 
-
 class Generator:
+
+    # Sparse drafting head and its per-round flag (set up in the constructor when enabled; class-level
+    # defaults keep iterate() valid on stubbed instances)
+    sparse_head = None
+    _sparse_flag = False
 
     def __init__(
         self,
@@ -42,6 +54,8 @@ class Generator:
         tokenizer: Tokenizer,
         max_batch_size: int = 256,
         max_chunk_size: int = 2048,
+        shared_chunk_size: int | None = None,
+        prefill_cooldown: int | None = 4,
         max_q_size: int = 8,
         draft_model: Model | None = None,
         draft_cache: Cache | None = None,
@@ -49,6 +63,11 @@ class Generator:
         show_visualizer: bool = False,
         enable_defrag: bool = True,
         cpu_cache_size: int = 0,
+        disk_cache_dir: str | None = None,
+        disk_cache_size: int = 50 * 1024**3,
+        disk_cache_flush_on_idle: bool = True,
+        disk_cache_checkpoint_interval: int = 4096,
+        disk_cache_write_interval: float = 2.0,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
@@ -59,6 +78,8 @@ class Generator:
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
         draft_row_budget: int | None = None,
+        draft_max_rows: int = 0,
+        sparse_draft_head: int = 0,
         **kwargs
     ):
         """
@@ -80,7 +101,23 @@ class Generator:
         :param max_chunk_size:
             Maximum number of tokens to process in parallel during prefill (prompt ingestion). Should not
             exceed the model's max_input_len but can be lowered to trade off prompt speed for a shorter
-            interruption to ongoing jobs when a new job is started.
+            interruption to ongoing jobs when a new job is started. See shared_chunk_size for lowering it
+            only while other jobs are generating.
+
+        :param shared_chunk_size:
+            Prefill chunk size to use while another active job is already generating, so that a new prompt
+            interrupts ongoing generation for shorter stretches at a time. Must be a multiple of the page size
+            and no larger than max_chunk_size. Prompt ingestion with no job generating keeps the full
+            max_chunk_size, which remains the efficient choice for cold prefill. Default is None, which selects
+            half of max_chunk_size rounded up to the page size. Set it to max_chunk_size to keep full chunks
+            while other jobs generate
+
+        :param prefill_cooldown:
+            Number of iterations to wait between prefill passes while another active job is generating. Every
+            call to iterate() still runs one generation step, so the generating jobs keep streaming at an even
+            pace while prompt ingestion takes one chunk every prefill_cooldown + 1 calls. With several prompts
+            waiting, they take turns, one chunk per pass. Default is 4. Set to 0 for a prefill pass on every
+            iteration, as when no job is generating
 
         :param max_q_size:
             Maximum number of tokens to evaluate per sequence during generation. Leave this at the default
@@ -111,6 +148,16 @@ class Generator:
             own guess. The intent is to catch verbatim repetition of context (reciting a drafted reply, editing
             source) and gamble a long verification pass on advancing many tokens at prefill speed. A recurrent
             model's cache needs max_history of at least this many tokens.
+
+        :param draft_max_rows:
+            Ceiling on the number of decoding rows in a speculative round, counting the verified draft
+            positions, i.e. bsz * (1 + draft tokens) (0 disables the ceiling). Draft length is capped when
+            possible to keep the batch from exceeding the ceiling.
+
+        :param sparse_draft_head:
+            Number of vocabulary columns in a dynamic sparse LM head for drafters that borrow the target's
+            lm_head (MTP, DFlash), 0 to disable. The subset follows the frequencies of the tokens seen in
+            prompts and generated text; verification always uses the full head, so output is unaffected.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
@@ -153,6 +200,39 @@ class Generator:
             being recomputed by prefill. In tensor-parallel mode each rank pins its own shard of the tier and
             the budget counts whole pages across all of them
 
+        :param disk_cache_dir:
+            Directory for a third, persistent tier behind the CPU page cache (requires cpu_cache_size > 0),
+            None (default) to disable. Pages entering the CPU tier and recurrent checkpoints are written
+            through to a per-model subdirectory (keyed by a fingerprint of the model, cache configuration and
+            kernel sources) and read back, in this or a later process, when a prompt's pages are in no other
+            tier. Page images and checkpoints are stored in a layout independent of the tensor-parallel
+            split, so a directory is shared between TP loads with different splits and non-TP loads of the
+            same model and cache configuration
+
+        :param disk_cache_size:
+            Budget in bytes for the whole disk_cache_dir, shared by every model and cache configuration
+            stored under it (the least recently used of the others are removed whole when a load finds the
+            root over budget). Default is 50 GB
+
+        :param disk_cache_flush_on_idle:
+            Also write every complete page still in VRAM (and every checkpoint) to the disk tier whenever the
+            generator goes idle, so a context never has to be evicted first to be persisted. Default True;
+            flush_cache_to_disk() does the same on demand
+
+        :param disk_cache_checkpoint_interval:
+            Minimum spacing, in tokens, between the recurrent checkpoints the disk tier keeps along any chain
+            of cached pages, counted from the start of the chain; closer ones (and checkpoints whose page is
+            gone) are pruned when the generator goes idle, so a resumed prompt replays at most this many
+            tokens. Checkpoints take far more space than pages on hybrid models. Default 4096; 0 keeps all
+
+        :param disk_cache_write_interval:
+            While jobs run, each this many seconds, queue the complete pages of the active sequences for the disk
+            tier (through the CPU tier). Without this, a page goes to disk only when it leaves VRAM or when the
+            generator becomes idle, so a process that stops during a long prefill loses all of it. With this, it
+            loses only the pages after the last checkpoint on disk. The last two pages before the position of
+            each sequence are not queued: speculative decoding can still rewind them, and the MTP draft cache
+            writes the last slot of a page one step later. 0 disables. Default 2.0
+
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
             Ignored if model doesn't use recurrent states
@@ -161,9 +241,10 @@ class Generator:
             Minimum number of tokens between recurrent checkpoints in model output and the tail end of
             the prompt. Must be a multiple of the page size. Model architecture determines default
 
-        :param recurrent_checkpoint_interval_pp]:
+        :param recurrent_checkpoint_interval_pp:
             Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
-            multiple of the page size. Default is 32768 tokens
+            multiple of the page size. Checkpoints land on the first chunk boundary at least this far past the
+            previous one, so the interval need not be a multiple of the chunk size. Default is 32768 tokens
 
         :param kwargs:
         """
@@ -223,6 +304,8 @@ class Generator:
         self.hybrid_draft_tokens = max(0, hybrid_draft_tokens or 0)
         self.max_draft_tokens = max(self.num_draft_tokens, self.hybrid_draft_tokens)
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
+        self.draft_max_rows = max(0, draft_max_rows or 0)
+        self._draft_window_last = None
         self.record_draft_stats = record_draft_stats
         if draft_row_budget is None:
             try:
@@ -232,11 +315,29 @@ class Generator:
         if type(draft_row_budget) is not int or draft_row_budget < 0:
             raise ValueError("draft_row_budget must be a nonnegative integer")
         self.draft_row_budget = draft_row_budget
+        # EXL3_DRAFT_ROW_BUDGET is the fork-era name for upstream's row ceiling; keep it working
+        # by folding it into draft_max_rows (both bound bsz * (1 + window)).
+        if draft_row_budget and not self.draft_max_rows:
+            self.draft_max_rows = draft_row_budget
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
+
+        # Prompt ingestion alongside generating jobs, see iterate()
+        if shared_chunk_size is None:
+            shared_chunk_size = (max_chunk_size // 2 + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+        assert 0 < shared_chunk_size <= max_chunk_size and shared_chunk_size % PAGE_SIZE == 0, \
+            "shared_chunk_size must be a multiple of the page size (256) and no larger than max_chunk_size"
+        if prefill_cooldown is None:
+            prefill_cooldown = 4
+        assert prefill_cooldown >= 0, \
+            "prefill_cooldown must not be negative"
+        self.shared_chunk_size = shared_chunk_size
+        self.prefill_cooldown = prefill_cooldown
+        self.prefill_cooldown_left = 0
+        self.prefill_rotation = 0
 
         # Job queues
         self.job_serial = 0
@@ -253,6 +354,8 @@ class Generator:
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
         self.staging_buffers = {}
+        self.stage_arenas = {}
+        self.stage_devices = None
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
         # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
@@ -269,13 +372,23 @@ class Generator:
                 pin_memory = True
             )
 
-        # CPU page cache tier
+        # CPU page cache tier, and the disk tier behind it
         self.cpu_page_cache = None
+        self.disk_page_cache = None
+        self.disk_cache_flush_on_idle = disk_cache_flush_on_idle
+        self.disk_cache_write_interval = disk_cache_write_interval
+        self._write_behind_time = 0.0
         if cpu_cache_size:
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
             self.cpu_page_cache.attach(self.pagetable)
             self.pagetable.cpu_tier = self.cpu_page_cache
+            if disk_cache_dir:
+                self.disk_page_cache = DiskPageCache(disk_cache_dir, tier_caches, self.cpu_page_cache, disk_cache_size,
+                                                     min_state_distance = disk_cache_checkpoint_interval)
+                self.cpu_page_cache.attach_disk(self.disk_page_cache)
+        elif disk_cache_dir:
+            raise ValueError("disk_cache_dir needs a CPU page cache tier to write through from (cpu_cache_size > 0)")
 
         # Visualizer
         if show_visualizer:
@@ -306,6 +419,16 @@ class Generator:
         if self.target_recurrent or self.draft_recurrent:
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size, draft_model)
             self.recurrent_cache.pagetable = self.pagetable
+            self.recurrent_cache.disk_tier = self.disk_page_cache
+            if self.disk_page_cache is not None:
+                # Which model and cache stash under each side of a PairedState: a tensor-parallel side's
+                # checkpoints are written and read by that model's ranks
+                self.disk_page_cache.recurrent_sides = {
+                    side: (m, c) for side, m, c, on in (
+                        ("target", self.model, cache, self.target_recurrent),
+                        ("draft", draft_model, draft_cache, self.draft_recurrent),
+                    ) if on
+                }
             # The new page table owns every page, so every state slot is ours too
             for c, recurrent in ((cache, self.target_recurrent), (draft_cache, self.draft_recurrent)):
                 if recurrent:
@@ -322,11 +445,8 @@ class Generator:
 
         assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval_pp % PAGE_SIZE == 0, \
             "checkpoint interval must be a multiple of the page size (256)"
-        def ceil_span(a, b):
-            return (a + b - 1) // b * b
-        recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
-        self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
+        self.recurrent_checkpoint_interval_pp = recurrent_checkpoint_interval_pp
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -351,6 +471,23 @@ class Generator:
         self.draft_confidence = draft_confidence
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+        # Sparse drafting head over a frequency-selected vocabulary subset (layer-split mode only)
+        self.sparse_head = None
+        self._sparse_flag = False
+        if sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
+            from ..modules.sparse_head import token_stats_path
+            # Drafters with a head of their own (Gemma4 assistant) take the subset there; the others borrow the
+            # target's head and the subset mirrors it
+            own = getattr(self.draft_model, "sparse_head_linear", None)
+            lm = own() if own is not None else model.modules[model.logit_layer_idx]
+            self.sparse_head = lm.make_sparse_head(
+                sparse_draft_head,
+                model.config.vocab_size,
+                profile_path = token_stats_path(model.config.directory, model.config.vocab_size),
+                embedding = model.modules[0] if self.mtp_draft else None,
+            )
+            self.sparse_head.benchmark()
 
 
     def num_remaining_jobs(self):
@@ -378,12 +515,27 @@ class Generator:
             tier_cached_tokens: reusable tokens held only in the system-memory tier (sysmem K/V cache), by the
                 same chain rule; 0 without a tier
             tier_max_tokens: capacity of the system-memory tier, 0 without one
-            alloc_pages: cumulative pages claimed by started jobs
-            alloc_cached_pages: cumulative pages of those that were reused from the prompt cache
-            alloc_tier_pages: of those, pages restored from the system-memory tier
-            hit_rate: alloc_cached_pages / alloc_pages, or None before any job has started
-            tier_hit_rate: alloc_tier_pages / alloc_pages, the part of hit_rate served from the system-memory
-                tier, or None before any job has started
+            disk_cached_tokens: reusable tokens held only in the disk tier, by the same chain rule (a chain
+                may run through all three tiers; the disk tier is persistent, so these survive a restart);
+                0 without a disk tier
+            disk_pages, disk_states: pages and recurrent checkpoints the disk tier holds for this model
+            disk_used_bytes, disk_max_bytes: the disk tier's occupancy and budget (the budget is for the whole
+                directory, every model and cache configuration under it); 0 without a disk tier
+            alloc_pages: cumulative pages claimed by started jobs, the pages reserved for generation included
+            alloc_prompt_pages: of those, the complete prompt pages, i.e. the ones a prompt-cache hit can serve
+            alloc_cached_pages: of those, pages that were reused from the prompt cache
+            alloc_tier_pages: of those, pages restored from the system-memory tier (including pages that were
+                promoted there from disk first)
+            alloc_disk_pages: of those, pages that came from the disk tier, whether the enqueue-time prefetch
+                or the allocation itself promoted them; a page counts here the first time it is restored after
+                its promotion and as an ordinary tier page from then on
+            hit_rate: alloc_cached_pages / alloc_prompt_pages, or None before any job has started. The
+                denominator is the prompt pages only, so this matches the per-request cached fraction rather
+                than being diluted by the pages each job reserves for its output
+            tier_hit_rate: alloc_tier_pages / alloc_prompt_pages, the part of hit_rate served from the
+                system-memory tier (disk promotions included), or None before any job has started
+            disk_hit_rate: alloc_disk_pages / alloc_prompt_pages, the part of tier_hit_rate that was read from
+                disk, or None before any job has started
             active_jobs, pending_jobs: current job counts
 
         The chain walk is memoized on a signature of the page tables, so repeated calls between changes are
@@ -391,6 +543,7 @@ class Generator:
         """
         pt = self.pagetable
         tier = pt.cpu_tier
+        disk = self.disk_page_cache
 
         # The chain walk is linear in the number of pages, which can be large with a big system-memory
         # tier, so it only reruns when something that can change the outcome has moved
@@ -403,6 +556,7 @@ class Generator:
             pt.last_defrag_serial,
             len(tier) if tier is not None else 0,
             (tier.metrics["pushes"], tier.metrics["evictions"]) if tier is not None else None,
+            (len(disk), len(disk.states), disk.metrics["page_writes"], disk.metrics["evictions"]) if disk is not None else None,
         )
         memo_signature, memo = self._cache_stats_memo
         if signature == memo_signature:
@@ -415,6 +569,11 @@ class Generator:
                 if is_content_hash(h):
                     gpu_links[h] = page.prev_hash
         tier_links = {h: e["prev_hash"] for h, e in tier.entries.items()} if tier is not None else {}
+        if disk is not None:
+            with disk._lock:
+                disk_links = {h: m["prev_hash"] for h, m in disk.pages.items()}
+        else:
+            disk_links = {}
 
         # A page is reusable when its whole chain is present in either tier
         resumable = {}
@@ -426,6 +585,8 @@ class Generator:
                     h = gpu_links[h]
                 elif h in tier_links:
                     h = tier_links[h]
+                elif h in disk_links:
+                    h = disk_links[h]
                 else:
                     resumable[h] = False
                     break
@@ -436,11 +597,14 @@ class Generator:
 
         cached = sum(1 for h in gpu_links if is_resumable(h))
         tier_cached = sum(1 for h in tier_links if h not in gpu_links and is_resumable(h))
+        disk_cached = sum(1 for h in disk_links if h not in gpu_links and h not in tier_links and is_resumable(h))
         used = len(pt.referenced_pages)
         free = sum(1 for h in pt.unreferenced_pages if not is_content_hash(h))
         alloc = pt.metrics["alloc_pages"]
+        alloc_prompt = pt.metrics["alloc_prompt_pages"]
         alloc_cached = pt.metrics["alloc_cached_pages"]
         alloc_tier = pt.metrics["alloc_tier_pages"]
+        alloc_disk = pt.metrics["alloc_disk_pages"]
         stats = {
             "page_size": PAGE_SIZE,
             "max_tokens": pt.max_pages * PAGE_SIZE,
@@ -449,11 +613,19 @@ class Generator:
             "free_tokens": free * PAGE_SIZE,
             "tier_cached_tokens": tier_cached * PAGE_SIZE,
             "tier_max_tokens": tier.max_slots * PAGE_SIZE if tier is not None else 0,
+            "disk_cached_tokens": disk_cached * PAGE_SIZE,
+            "disk_pages": len(disk) if disk is not None else 0,
+            "disk_states": len(disk.states) if disk is not None else 0,
+            "disk_used_bytes": disk.total_size if disk is not None else 0,
+            "disk_max_bytes": disk.root_size if disk is not None else 0,
             "alloc_pages": alloc,
+            "alloc_prompt_pages": alloc_prompt,
             "alloc_cached_pages": alloc_cached,
             "alloc_tier_pages": alloc_tier,
-            "hit_rate": alloc_cached / alloc if alloc else None,
-            "tier_hit_rate": alloc_tier / alloc if alloc else None,
+            "alloc_disk_pages": alloc_disk,
+            "hit_rate": alloc_cached / alloc_prompt if alloc_prompt else None,
+            "tier_hit_rate": alloc_tier / alloc_prompt if alloc_prompt else None,
+            "disk_hit_rate": alloc_disk / alloc_prompt if alloc_prompt else None,
             "active_jobs": len(self.active_jobs),
             "pending_jobs": len(self.pending_jobs),
         }
@@ -502,6 +674,12 @@ class Generator:
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
         self.pending_jobs.append(job)
+        if self.disk_page_cache is not None:
+            # Start reading the prompt's pages that only the disk tier holds, so the allocation finds them in
+            # the CPU tier (or in flight) rather than waiting on the disk itself
+            for seq in job.sequences:
+                hashes = seq.page_hashes if seq.max_cached_pages is None else seq.page_hashes[:seq.max_cached_pages]
+                self.disk_page_cache.prefetch(hashes, self.pagetable.access_serial)
         return job.serial_number
 
 
@@ -615,10 +793,35 @@ class Generator:
         results = []
         self.iterate_start_jobs(results)
 
-        # Perform one round of prefill
+        # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
+        # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
+        # shared chunk size, and only once the cooldown since the previous pass has elapsed, so every call
+        # still produces one generation step for the generating jobs. The other jobs' passes are deferred;
+        # jobs with nothing left to ingest keep their call, which only does bookkeeping. With no job
+        # generating, or with a full shared chunk and no cooldown, every job runs a full chunk on every
+        # iteration
+        prefilling = [job for job in self.active_jobs if not job.is_prefill_done()]
+        chunk_size = None
+        deferred = []
+        if prefilling and len(prefilling) < len(self.active_jobs) and \
+                (self.shared_chunk_size < self.max_chunk_size or self.prefill_cooldown > 0):
+            if self.shared_chunk_size < self.max_chunk_size:
+                chunk_size = self.shared_chunk_size
+            if self.prefill_cooldown_left > 0:
+                self.prefill_cooldown_left -= 1
+                deferred = prefilling
+            else:
+                self.prefill_cooldown_left = self.prefill_cooldown
+                selected = prefilling[self.prefill_rotation % len(prefilling)]
+                self.prefill_rotation += 1
+                deferred = [job for job in prefilling if job is not selected]
+        else:
+            self.prefill_cooldown_left = 0
         for job in list(self.active_jobs):
+            if any(job is d for d in deferred):
+                continue
             try:
-                job.prefill(results)
+                job.prefill(results, chunk_size)
             except Exception as e:
                 self.reap_failed_job(job, e, results)
 
@@ -626,14 +829,19 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
 
-        # Generation with draft model
-        if self.draft_model:
+        # Generation with draft model, with the draft window trimmed to the row ceiling (draft_max_rows)
+        draft_window = self.row_limited(self.num_draft_tokens) if self.draft_model else 0
+        round_start = None
+        if self.sparse_head is not None and draft_window > 0:
+            self._sparse_flag = self.sparse_head.round_flag()
+            round_start = time.perf_counter()
+        if self.draft_model and draft_window > 0:
             if self.dflash_draft:
-                draft_tokens = self.iterate_draftmodel_dflash_gen(results)
+                draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_window)
             elif self.mtp_draft:
-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                draft_tokens = self.iterate_draftmodel_mtp_gen(results, draft_window)
             else:
-                draft_tokens = self.iterate_draftmodel_gen(results)
+                draft_tokens = self.iterate_draftmodel_gen(results, draft_window)
 
         # Generation with n-gram draft
         elif self.ngram_match_min:
@@ -645,7 +853,9 @@ class Generator:
 
         # Long suffix-match draft over the regular one, when a job is repeating its context
         if self.hybrid_draft_tokens:
-            draft_tokens = self.iterate_hybrid_gen(draft_tokens)
+            draft_tokens = self.iterate_hybrid_gen(
+                draft_tokens, self.row_limited(self.hybrid_draft_tokens)
+            )
 
         if (
             draft_tokens is not None and self.draft_model is not None
@@ -654,10 +864,18 @@ class Generator:
             self.iterate_exact_serial_draft(results, draft_tokens)
         else:
             self.iterate_gen(results, draft_tokens)
+        if round_start is not None and draft_tokens is not None:
+            # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
+            drafted = draft_tokens.shape[-1]
+            self.sparse_head.note_round(time.perf_counter() - round_start, drafted, drafted if self.mtp_draft else 1)
 
         # Visualization
         if self.visualizer:
             self.update_visualizer()
+
+        # Disk tier: queue the complete pages of the active sequences (see disk_cache_write_interval)
+        if self.disk_page_cache is not None and self.active_jobs and self.disk_cache_write_interval > 0:
+            self.write_behind()
 
         # Finished iteration
         return results
@@ -675,6 +893,15 @@ class Generator:
         RAM, in the tensor-parallel ranks too), the CPU page cache tier (cpu_cache_size of pinned memory),
         the pinned staging and draft buffers, and the filter thread pool.
         """
+        if self.disk_page_cache is not None:
+            # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away.
+            # After abort() (generator error), nothing is written
+            if self.disk_cache_flush_on_idle and not self.disk_page_cache.write_disabled:
+                self.flush_cache_to_disk()
+            self.disk_page_cache.close()
+            self.disk_page_cache = None
+            if self.recurrent_cache is not None:
+                self.recurrent_cache.disk_tier = None
         if self.recurrent_cache is not None:
             self.recurrent_cache.close()
         if self.cpu_page_cache is not None:
@@ -683,9 +910,131 @@ class Generator:
             self.pagetable.cpu_tier = None
         self.sample_pinned = None
         self.staging_buffers = {}
+        self.stage_arenas = {}
         self.draft_input_ids_pinned = None
         self.draft_ids_pinned = None
         self.filter_pool.shutdown(wait = False)
+
+
+    @torch.inference_mode()
+    def flush_cache_to_disk(self, wait: bool = False, max_pages: int | None = None) -> dict:
+        """
+        Queue every complete, content-hashed page that is in VRAM but in neither the CPU nor the disk tier for
+        persistence (through the CPU tier, whose store is the write-through point), and every recurrent
+        checkpoint not yet on disk. Returns counts of what was queued; with wait = True returns once the
+        writer has finished.
+
+        max_pages limits the number of pages queued in one call. Each page takes a CPU-tier slot until its
+        write is complete. If the pages are more than the free slots, the tier must wait for the writer, and
+        this call stops the generator for that time. With a limit, the call stops early and sets "more" in the
+        result. The idle loop then calls again (see idle_work).
+        """
+        disk = self.disk_page_cache
+        tier = self.cpu_page_cache
+        queued = {"pages": 0, "states": 0, "more": False}
+        if disk is None:
+            return queued
+        pt = self.pagetable
+        pages = list(pt.unreferenced_pages.values()) + list(pt.referenced_pages.values())
+        queued["pages"], queued["more"] = self._queue_pages_to_disk(pages, max_pages)
+        rc = self.recurrent_cache
+        if rc is not None and rc.disk_tier is not None:
+            # Checkpoints follow their pages: every complete page is queued above, so an anchored checkpoint
+            # is written now, the rest stay candidates. The last checkpoint of each chain (no other checkpoint
+            # in RAM is after it on its chain) is written also when it is closer than min_state_distance to
+            # the one before: a conversation continues from the end of its chain
+            keys = [h for h in rc.keys() if is_content_hash(h)]
+            keyset = set(keys)
+            covered = set()
+            limit = pt.max_pages + len(tier) + len(disk)
+            for k in keys:
+                h = disk.chain_prev(k)
+                steps = 0
+                while h is not None and steps <= limit and h not in covered:
+                    if h in keyset:
+                        covered.add(h)
+                    h = disk.chain_prev(h)
+                    steps += 1
+            for h in keys:
+                stashed = rc.get(h)
+                if stashed is None or not (disk.has_page(h) or h in disk.pending_pages):
+                    continue
+                if disk.write_state(h, stashed, force = h not in covered):
+                    queued["states"] += 1
+        queued["states_pruned"] = disk.prune_states()
+        self._disk_backlog = queued["more"]
+        if wait:
+            disk.flush()
+        return queued
+
+
+    def _queue_pages_to_disk(self, pages, budget: int | None) -> tuple[int, bool]:
+        """
+        Queue the complete, content-hashed, persistable pages among `pages` that are in VRAM but in neither the
+        CPU nor the disk tier, through the CPU tier (its store is the write-through point; the copy to host
+        memory goes on the current stream, after the kernels that wrote the page and before any that could
+        write it again). Stops after `budget` pages. Returns (pages queued, stopped early).
+        """
+        disk, tier, pt = self.disk_page_cache, self.cpu_page_cache, self.pagetable
+        queued = 0
+        for page in pages:
+            h = page.phash
+            if page.kv_position != PAGE_SIZE or not is_content_hash(h) or not page.persistable:
+                continue
+            if h in tier or disk.has_page(h) or h in disk.pending_pages:
+                continue
+            if budget is not None and queued >= budget:
+                return queued, True
+            tier.store(page, pt.access_serial)
+            queued += 1
+        return queued, False
+
+
+    @torch.inference_mode()
+    def write_behind(self):
+        """
+        Queue the complete pages of the active sequences for the disk tier, at most once per
+        disk_cache_write_interval seconds, so a process that dies during a long prefill loses only what came
+        after the last page (and checkpoint) written. The generator does not wait for the copies or the disk.
+
+        The last two pages before a sequence's position are not queued: speculative decoding can still rewind
+        them, and the MTP draft cache writes the last slot of a page one step later. One call queues at most
+        a quarter of the CPU tier, less the writes still queued, so the tier never has to wait for the writer
+        to free a slot.
+        """
+        now = time.monotonic()
+        if now - self._write_behind_time < self.disk_cache_write_interval:
+            return
+        self._write_behind_time = now
+        disk = self.disk_page_cache
+        if disk.write_disabled:
+            return
+        budget = self.cpu_page_cache.max_slots // 4 - len(disk.pending_pages)
+        if budget <= 0:
+            return
+        pages = []
+        for job in self.active_jobs:
+            for seq in job.sequences:
+                if seq.allocated_pages:
+                    pages.extend(seq.allocated_pages[:max(0, seq.kv_position // PAGE_SIZE - 2)])
+        self._queue_pages_to_disk(pages, budget)
+
+
+    def _idle_flush_budget(self) -> int:
+        """Pages for one idle flush step: half the CPU tier, less the writes still queued"""
+        return max(1, self.cpu_page_cache.max_slots // 2 - len(self.disk_page_cache.pending_pages))
+
+
+    def has_idle_work(self) -> bool:
+        """True if the idle flush stopped early and has more pages to queue"""
+        return self.disk_page_cache is not None and getattr(self, "_disk_backlog", False)
+
+
+    @torch.inference_mode()
+    def idle_work(self):
+        """Do one more idle flush step, if no job is queued. The async generator calls this while idle"""
+        if self.has_idle_work() and not self.num_remaining_jobs():
+            self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
 
 
     @torch.inference_mode()
@@ -696,6 +1045,13 @@ class Generator:
         glibc is retaining from stash/offload churn (issue #277) — sub-threshold residue would otherwise sit
         in the arenas for the whole idle period.
         """
+        if self.sparse_head is not None:
+            self.sparse_head.save_profile()
+        if self.disk_page_cache is not None and self.disk_cache_flush_on_idle and \
+                not self.disk_page_cache.write_disabled:
+            # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk. One
+            # step only; the async generator does the rest while idle (idle_work)
+            self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
             # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
@@ -730,7 +1086,7 @@ class Generator:
         self.visualizer.update(chains, usage)
 
 
-    def iterate_draftmodel_gen(self, results: list):
+    def iterate_draftmodel_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
 
@@ -739,7 +1095,7 @@ class Generator:
         max_seq_len = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
-            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + window + 1)
             batch_size += 1
         if batch_size == 0:
             return None
@@ -815,7 +1171,6 @@ class Generator:
             return p
 
         # Greedy sample batched draft tokens. With a confidence calibrator, drafting stops early
-        window = self.num_draft_tokens
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -851,32 +1206,21 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
-    def _mtp_window(self, batch_size: int) -> int:
-        """Bound MTP verify rows while preserving the single-stream draft length."""
-        full = self.num_draft_tokens
-        if batch_size <= 1 or full <= 0 or self.draft_row_budget == 0:
-            return full
-        return max(0, min(full, self.draft_row_budget // batch_size - 1))
-
-
-    def iterate_draftmodel_mtp_gen(self, results: list):
+    def iterate_draftmodel_mtp_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
-        self._mtp_skipped_round = False
 
         # Get shape of active batch
         batch_size = 0
         max_seq_len = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
-            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + window + 1)
             batch_size += 1
         if batch_size == 0:
             return None
-        mtp_window = self._mtp_window(batch_size)
 
-        # Create block index table for batch. Keep draft staging separate from the target's
-        # in-flight buffers; pageable uploads would block each draft step.
+        # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
         # pageable copies; the draft's own buffers, since the target's are still in flight
@@ -900,10 +1244,8 @@ class Generator:
             if not job.is_prefill_done(): continue
             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
             if job.mtp_last_hidden is None:
-                # A one-token prompt (or a rewind) has no valid carry yet. Run one
-                # normal target step, then commit the current MTP position for EVERY
-                # batch member before resuming drafts, including peers with a carry.
-                self._mtp_skipped_round = True
+                # A one-token prompt has no token to prefill before the generation input.
+                # Run one normal target step first; iterate_gen() will initialize MTP state.
                 return None
             if job.time_first_token is None:
                 cuda_sync_active()
@@ -911,74 +1253,60 @@ class Generator:
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
             mtp_hidden_list.append(job.mtp_last_hidden)
+        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
+        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
-        if mtp_window == 0:
-            # iterate_gen assumes position K has been written by the MTP pass. A wide
-            # batch may propose no tokens, but it must still commit that position before
-            # the target advances: otherwise a later smaller batch resumes with holes in
-            # the draft KV cache. No draft head or draft sampling runs on this path.
-            self.draft_model.prefill(
-                torch.cat(input_ids_list, dim = 0),
-                {
-                    "target_hidden": temp_hidden,
-                    "attn_mode": "flash_attn",
-                    "block_table": block_index,
-                    "cache": self.draft_cache,
-                    "cache_seqlens": cache_seqlens,
-                },
-            )
-            return None
-        # Device-resident draft chain (EXL3_MTP_DEVICE_DRAFT): ids stay on the draft device
-        # between steps (the Embedding mirrors its table there), so the window costs one
-        # readback instead of one per drafted token
-        dev_draft = _MTP_DEVICE_DRAFT and self.draft_calibrator is None and temp_hidden.is_cuda
-        if dev_draft:
-            ddev = temp_hidden.device
-            batch_ids = torch.cat(input_ids_list, dim = 0).to(ddev, non_blocking = True)
-            dev_draft_ids = torch.empty((batch_size, mtp_window), dtype = torch.long, device = ddev)
-            # Each pinned source must remain unchanged until its asynchronous H2D read
-            # completes. Device-resident drafting has no per-step sync, so an in-place
-            # increment of one shared cache_seqlens buffer races with those reads.
-            # Build immutable per-step rows once; the final token readback fences reuse.
-            cache_seqlens_steps = self._staging("draft_chain_seqlens", mtp_window, batch_size)
-            cache_seqlens_steps.copy_(
-                cache_seqlens[None, :] + torch.arange(mtp_window, dtype = torch.int32)[:, None]
-            )
-        else:
-            batch_ids = self.draft_input_ids_pinned[:batch_size, :]
-            batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
-        window = mtp_window
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        # The drafted ids stay on the device inside the loop: each step's argmax feeds the next step's
+        # input directly (with the sparse head, together with the token's embedding row, so the embedding
+        # table is never consulted), and the window comes back to pinned memory in one copy at the end
+        draft_cols = []
+        draft_emb = None
+        embed_device = self.model.modules[0].device
+        # A drafter without K/V of its own reads the target's cache (and window rings) at the K/V position
+        # of the round; its query position stays at the last accepted token for every step, as the
+        # reference implementation drafts
+        target_kv = self.draft_model.caps.get("draft_uses_target_cache", False)
+        if target_kv:
+            kv_seqlens = cache_seqlens.clone()
+            target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
+                if self.target_recurrent else None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
-                "cache": self.draft_cache,
-                "cache_seqlens": cache_seqlens_steps[idx] if dev_draft else cache_seqlens,
+                "cache": self.cache if target_kv else self.draft_cache,
+                "cache_seqlens": kv_seqlens if target_kv else cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
+                "sparse_head": self._sparse_flag,
             }
+            if target_kv:
+                params["positions"] = kv_seqlens
+                if target_states is not None:
+                    params["source_recurrent_states"] = target_states
             if cal is not None:
                 params["export_draft_conf"] = True
+            if draft_emb is not None:
+                params["draft_embedding"] = draft_emb
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            if dev_draft:
-                dev_draft_ids[:, idx:idx+1] = new_ids
-                batch_ids = new_ids
-            else:
-                self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-                batch_ids.copy_(new_ids)
-            if not dev_draft:
-                cache_seqlens += 1
-            temp_hidden = batch_state
+            draft_cols.append(new_ids)
+            draft_emb = params.get("draft_embedding")
+            # Without a row from the sparse head, the next step looks the token up in the embedding table,
+            # which wants the ids on its own device (a host round trip for a CPU-resident table, as before)
+            batch_ids = new_ids if draft_emb is not None else to_device(new_ids, embed_device)
+            cache_seqlens += 1
+            # Drafters that re-project their state for the next step hand it back through params
+            temp_hidden = params["next_target_hidden"] if "next_target_hidden" in params else batch_state
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:
                 c = draft_conf.float().cpu()
@@ -988,11 +1316,7 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
-
-        if dev_draft:
-            # one readback for the whole window
-            self.draft_ids_pinned[:batch_size, :window].copy_(dev_draft_ids[:, :window])
-            return self.draft_ids_pinned[:, :window]
+        self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_cols, dim = 1))
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -1005,7 +1329,7 @@ class Generator:
 
 
     # TODO: Refactor, share code with other draft fns
-    def iterate_draftmodel_dflash_gen(self, results: list):
+    def iterate_draftmodel_dflash_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
 
@@ -1016,19 +1340,15 @@ class Generator:
             if not job.is_prefill_done(): continue
             max_seq_len = max(
                 max_seq_len,
-                job.get_max_seq_len() + self.num_draft_tokens + 1,
+                job.get_max_seq_len() + window + 1,
                 job.get_max_seq_len() + self.draft_model.config.block_size + 1
             )
             batch_size += 1
         if batch_size == 0:
             return None
 
-        # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
-        window = self.num_draft_tokens
-        # Verify windows (input token + drafts) are capped where the target's one-pass verify stays exact
-        max_rows = self.draft_model.caps.get("max_verify_rows")
-        if max_rows:
-            window = min(window, max(1, max_rows - 1))
+        # The diffusion drafter always runs at its fixed block size; the row ceiling and the dynamic
+        # window only truncate the verified part of the drafted block
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
@@ -1072,6 +1392,7 @@ class Generator:
             params["recurrent_states"] = [job.recurrent_state.draft for job in self.active_jobs if job.is_prefill_done()]
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
+        params["sparse_head"] = self._sparse_flag
         out_state = self.draft_model.forward(
             input_ids = batch_ids,
             params = params,
@@ -1219,21 +1540,54 @@ class Generator:
 
     def new_recurrent_state(self) -> PairedState:
         """A fresh (cleared) pair of recurrent states for a new sequence, one side per recurrent model"""
-        return PairedState(
-            self.cache.get_new_state() if self.target_recurrent else None,
-            self.draft_cache.get_new_state() if self.draft_recurrent else None,
-        )
+        target = draft = None
+        try:
+            target = self.cache.get_new_state() if self.target_recurrent else None
+            draft = self.draft_cache.get_new_state() if self.draft_recurrent else None
+            return PairedState(target, draft)
+        except BaseException:
+            if draft is not None:
+                draft.free()
+            if target is not None:
+                target.free()
+            raise
 
 
     def recurrent_state_from_stashed(self, stashed: dict, position: int) -> PairedState:
         """The pair restored from a checkpoint stash (PairedState.stash) at `position`"""
-        return PairedState(
-            self.cache.new_from_stashed(stashed["target"], position) if self.target_recurrent else None,
-            self.draft_cache.new_from_stashed(stashed["draft"], position) if self.draft_recurrent else None,
-        )
+        target = draft = None
+        try:
+            target = self.cache.new_from_stashed(stashed["target"], position) if self.target_recurrent else None
+            draft = self.draft_cache.new_from_stashed(stashed["draft"], position) if self.draft_recurrent else None
+            return PairedState(target, draft)
+        except BaseException:
+            if draft is not None:
+                draft.free()
+            if target is not None:
+                target.free()
+            raise
 
 
-    def iterate_hybrid_gen(self, draft_tokens: torch.Tensor | None):
+    def row_limited(self, window: int) -> int:
+        """
+        Trim a draft window so that bsz * (1 + window) rows stay under draft_max_rows (see the constructor).
+        """
+        if not self.draft_max_rows or not window:
+            return window
+        rows = 0
+        for job in self.active_jobs:
+            if job.is_prefill_done():
+                rows += len(job.sequences)
+        if rows < 1:
+            return window
+        limited = min(window, max(0, self.draft_max_rows // rows - 1))
+        if window == self.num_draft_tokens and limited != self._draft_window_last:
+            self._draft_window_last = limited
+            logger.debug("draft_max_rows %d, %d rows: draft window %d",
+                         self.draft_max_rows, rows, limited)
+        return limited
+
+    def iterate_hybrid_gen(self, draft_tokens: torch.Tensor | None, H: int):
         """
         Replace the round's draft with hybrid_draft_tokens tokens of suffix-match continuation when some job's
         current suffix matches at least that many tokens of its earlier context and the continuation agrees
@@ -1241,11 +1595,11 @@ class Generator:
         when any row takes the long draft every row does: rows without a qualifying match keep their regular
         draft and are padded with whatever continuation their longest match offers, then with repeats of
         their last token, which verification rejects at the first mismatch. Returns the (rows, width) draft
-        for iterate_gen, or the regular draft unchanged.
+        for iterate_gen, or the regular draft unchanged. H is that length for this round, already trimmed
+        to the row ceiling.
         """
-        H = self.hybrid_draft_tokens
         jobs = [job for job in self.active_jobs if job.is_prefill_done()]
-        if not jobs:
+        if not jobs or not H:
             return draft_tokens
         rows = []
         fire = False
@@ -1282,6 +1636,23 @@ class Generator:
         return out
 
 
+    def _sparse_head_update(self, jobs: list, accepted_lengths: list[int]):
+        """
+        Feed this step's target tokens to the sparse head. A job's first step contributes its whole context
+        (prompt and anything generated so far) at prompt weight, since the identifiers a reply reuses are
+        mostly already in its prompt; later steps contribute the tokens the target just accepted or sampled
+        """
+        sh = self.sparse_head
+        for job, n in zip(jobs, accepted_lengths):
+            seq = job.sequences[0]
+            if not job.sparse_head_seeded:
+                job.sparse_head_seeded = True
+                sh.observe(seq.sequence_ids.torch(), sh.prompt_weight)
+            elif n > 0:
+                sh.observe(seq.sequence_ids.torch_slice(len(seq.sequence_ids) - n, None), 1.0)
+        sh.maintain()
+
+
     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
         """
         Reusable pinned staging buffer, keyed by name and row width, grown by rows on demand.
@@ -1296,6 +1667,65 @@ class Generator:
         return buf[:rows]
 
 
+    def _stage_arena(self, rows: int, width: int, with_positions: bool):
+        """
+        Pinned int32 arena holding one step's block index [rows, width], cache_seqlens [rows] and optionally
+        positions [rows] back to back (the layout ext.generator_stage_decode fills), with its views and a device
+        copy per attention device. Keyed by shape, so the views keep their identity from step to step.
+        """
+        key = (rows, width, with_positions)
+        arena = self.stage_arenas.get(key)
+        if arena is None:
+            if len(self.stage_arenas) >= 32:
+                self.stage_arenas.clear()
+            n = rows * width + rows * (2 if with_positions else 1)
+            host = torch.zeros((n,), dtype = torch.int32, pin_memory = True)
+            arena = (host, self._arena_views(host, rows, width, with_positions), {})
+            self.stage_arenas[key] = arena
+        return arena
+
+
+    @staticmethod
+    def _arena_views(t: torch.Tensor, rows: int, width: int, with_positions: bool):
+        nbi = rows * width
+        return (
+            t[:nbi].view(rows, width),
+            t[nbi:nbi + rows],
+            t[nbi + rows:nbi + 2 * rows] if with_positions else None,
+        )
+
+
+    def _upload_arena(self, arena, rows: int, width: int, with_positions: bool, params: dict):
+        """
+        Upload the staged tables to every attention device with one copy each, and seed the forward's per-device
+        tensor cache (util.tensor.get_for_device) with the device views, so the layers find them there instead of
+        uploading each table separately when first touched. The device arena is reused from step to step: its next
+        upload is stream-ordered after the kernels reading this one.
+        """
+        if self.stage_devices is None:
+            # TP forwards ship params to the workers themselves; there the tables stay host-side
+            self.stage_devices = [] if self.model.loaded_tp else \
+                sorted({torch.device(m.device) for m in self.model.get_cache_layers() if m.device is not None and
+                        torch.device(m.device).type == "cuda"}, key = lambda d: d.index)
+        if not self.stage_devices:
+            return
+        host, views, dev = arena
+        dev_cache = {}
+        for device in self.stage_devices:
+            d = dev.get(device)
+            if d is None:
+                darena = torch.empty_like(host, device = device)
+                d = (darena, self._arena_views(darena, rows, width, with_positions))
+                dev[device] = d
+            darena, dviews = d
+            with torch.cuda.device(device):
+                ext.cuda_memcpy_async(darena.data_ptr(), host.data_ptr(), host.numel() * 4, 1)
+            for hv, dv in zip(views, dviews):
+                if hv is not None:
+                    dev_cache[(id(hv), device)] = (hv, dv)
+        params["dev_cache"] = dev_cache
+
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
@@ -1303,9 +1733,10 @@ class Generator:
         # determines how many cache pages the temporary block table needs for this iteration.
         batch_size = 0
         max_seq_len = 0
+        draft_len = draft_tokens.shape[-1] if draft_tokens is not None else 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
-            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens)
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + draft_len)
             batch_size += len(job.sequences)
         if batch_size == 0:
             return
@@ -1320,46 +1751,67 @@ class Generator:
         # since the kernels bound their reads by the cache lengths
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         max_pages_batch = (max_pages_batch + 15) // 16 * 16
-        block_index = self._staging("block_index", batch_size, max_pages_batch)
-        block_index.zero_()
-        cache_seqlens = self._staging("cache_seqlens", batch_size)
-        batch = 0
         use_offsets = "mrope" in self.model.caps
-        positions = self._staging("positions", batch_size) if use_offsets else None
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                if use_offsets:
-                    positions[batch] = seq.kv_position + job.alt_rope_offset
-                batch += 1
+        arena = self._stage_arena(batch_size, max_pages_batch, use_offsets)
+        block_index, cache_seqlens, positions = arena[1]
 
-        # Collect input IDs and indexed embeddings
-        # Jobs may contribute multiple sequence rows. logit_mapping records the slice of the model output that
-        # belongs to each active job, while batch_jobs keeps the corresponding Job objects in compact-batch order.
-        input_ids_list = []
+        # Collect the rows' tables, and their input IDs and indexed embeddings. Jobs may contribute multiple
+        # sequence rows. logit_mapping records the slice of the model output that belongs to each active job, while
+        # batch_jobs keeps the corresponding Job objects in compact-batch order. Single-token decode rows (no draft)
+        # have their input token gathered and recorded in its cache page by the staging call below, together with
+        # the tables; any other row takes the general path through get_input_ids_list
+        seq_bi, seq_kvp, seq_rope = [], [], []
+        dec_ids, dec_pages, dec_offsets = [], [], []
+        decode_rows = draft_tokens is None
         active_embeddings = []
         logit_mapping = []
         batch_jobs = []
+        rows = 0
         for job in self.active_jobs:
-            logit_mapping.append(len(input_ids_list))
+            logit_mapping.append(rows)
             if not job.is_prefill_done(): continue
             if job.time_first_token is None:
                 cuda_sync_active()
                 job.time_first_token = time.time()
-            job_ids = job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
-            input_ids_list += job_ids
+            for seq in job.sequences:
+                kvp = seq.kv_position
+                seq_bi.append(seq.block_index_tensor)
+                seq_kvp.append(kvp)
+                if use_offsets:
+                    seq_rope.append(job.alt_rope_offset)
+                if decode_rows:
+                    decode_rows = len(seq.sequence_ids) - kvp == 1
+            rows += len(job.sequences)
             batch_jobs.append(job)
             active_embeddings += job.embeddings
-        logit_mapping.append(len(input_ids_list))
-        ids_width = input_ids_list[0].shape[-1]
-        if all(ids.shape[-1] == ids_width for ids in input_ids_list):
-            ids_staging = self._staging("batch_ids", len(input_ids_list), ids_width, torch.long)
-            batch_ids = torch.cat(input_ids_list, dim = 0, out = ids_staging)
+        logit_mapping.append(rows)
+
+        if decode_rows:
+            for job in batch_jobs:
+                for seq in job.sequences:
+                    page = seq.allocated_pages[seq.kv_position // PAGE_SIZE]
+                    assert page.ref_count == 1
+                    dec_ids.append(seq.sequence_ids.tensor)
+                    dec_pages.append(page.sequence)
+                    dec_offsets.append(page.kv_position)
+                    page.kv_position += 1
+                    page.can_revert = False
+            batch_ids = self._staging("batch_ids", rows, 1, torch.long)
         else:
-            batch_ids = torch.cat(input_ids_list, dim = 0)
+            batch_ids = None
+        ext.generator_stage_decode(
+            arena[0], max_pages_batch, seq_bi, seq_kvp, seq_rope, batch_ids, dec_ids, dec_pages, dec_offsets
+        )
+        if not decode_rows:
+            input_ids_list = []
+            for job in batch_jobs:
+                input_ids_list += job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
+            ids_width = input_ids_list[0].shape[-1]
+            if all(ids.shape[-1] == ids_width for ids in input_ids_list):
+                ids_staging = self._staging("batch_ids", len(input_ids_list), ids_width, torch.long)
+                batch_ids = torch.cat(input_ids_list, dim = 0, out = ids_staging)
+            else:
+                batch_ids = torch.cat(input_ids_list, dim = 0)
 
         # Collect recurrent states for batch
         # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
@@ -1392,6 +1844,7 @@ class Generator:
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
         }
+        self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(
@@ -1517,42 +1970,56 @@ class Generator:
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
                 rejected = 0
+                W = batch_logits.shape[1]
 
-                # Batched verify (EXL3_BATCH_VERIFY): sample every position of the verification
-                # window in one sampler call and compare against the draft on-device, so the
-                # round pays one launch->readback sync instead of one per position. Only for
-                # samplers whose per-position result does not depend on earlier positions in the
-                # same window (no past-id penalties, filters, forced tokens, phase budgets or prob exports),
-                # and which explicitly opt in to position-independent verification.
-                pre_tokens = None
-                pre_match = None
-                if (
-                    _BATCH_VERIFY and draft_tokens is not None and batch_logits.shape[1] > 1 and
-                    len(job.sequences) == 1 and not job.filters and job.forced_ids is None and
-                    getattr(job, "token_budget", None) is None and
-                    not job.return_probs and job.return_top_tokens == 0 and job.new_tokens >= 0 and
-                    not getattr(job.sampler, "reqs_past_ids", False) and job.device_logit_mask is None and
-                    getattr(job.sampler, "supports_batch_verify", False)
-                ):
-                    q_ = batch_logits.shape[1]
-                    all_tokens = job.sampler.forward(
-                        job_logits.view(q_, 1, -1),
-                        None,
-                        job.rng.randint(0, (1<<32)-1),
-                        self.tokenizer,
-                        logit_mask = None
-                    ).view(q_)
-                    d_ = draft_tokens[j, :q_ - 1].to(all_tokens.device, non_blocking = True)
-                    match_ = (all_tokens[:q_ - 1] == d_)
-                    packed_ = torch.cat([all_tokens, match_.to(all_tokens.dtype)]).cpu()   # single sync
-                    pre_tokens = packed_[:q_]
-                    pre_match = packed_[q_:].tolist()
+                # Positions within a job are independent when no per-position constraint advances between
+                # them: no active filter (masks are rebuilt per accepted position), no sampling past IDs
+                # (repetition penalty), no banned-string checkpoint, and outside the min_new_tokens mask
+                # window (token healing, new_tokens < 0, is covered by the last test). Then all samplers
+                # launch up front in serial-loop order (each position's RNG draw is unchanged) and the W
+                # sampled tokens read back through one pinned buffer and one synchronize, as in the
+                # no-draft path, leaving a host-only accept/reject walk. Constrained jobs keep the serial
+                # loop below.
+                # A dormant triggered filter can activate on a token inside the window and constrain the
+                # positions after it, and a pending constrain_output_now injection is consumed one token per
+                # sampled position; both keep the serial loop
+                batchable = (
+                    _BATCH_VERIFY
+                    and not _NO_BATCH_READBACK
+                    and b - a == 1
+                    and job.checkpoint is None
+                    and job.forced_ids is None
+                    and job.new_tokens >= job.min_new_tokens
+                    and not any(f.is_active or f.trigger_token is not None for f in job.filters)
+                    and not job.sampler.reqs_past_ids
+                )
+                staged = None
+                if batchable:
+                    rng_state = job.rng.getstate()
+                    staged = []
+                    any_cuda = False
+                    for i in range(W):
+                        token_logits = job_logits[:, i:i + 1, :]
+                        sampled = job.receive_logits(token_logits)
+                        is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
+                        staged.append((sampled, is_cuda))
+                        any_cuda |= is_cuda
+                    if any_cuda:
+                        pinned_w = getattr(self, "draft_sample_pinned", None)
+                        if pinned_w is None or pinned_w.shape[1] < W:
+                            pinned_w = torch.empty((1, max(W, 8)), dtype = torch.long, pin_memory = True)
+                            self.draft_sample_pinned = pinned_w
+                        for i, (sampled, is_cuda) in enumerate(staged):
+                            if is_cuda:
+                                pinned_w[0:1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
+                                staged[i] = ((pinned_w[0:1, i:i + 1],) + sampled[1:], False)
+                        torch.cuda.synchronize(batch_logits.device)
 
-                for i in range(batch_logits.shape[1]):
+                for i in range(W):
+                    positions_used = i + 1
                     token_logits = job_logits[:, i:i + 1, :]
-                    if pre_tokens is not None:
-                        next_token = pre_tokens[i:i + 1].view(1, 1)
-                        next_k_tokens = next_k_probs = next_prob = None
+                    if staged is not None:
+                        (next_token, next_k_tokens, next_k_probs, next_prob), _ = staged[i]
                     else:
                         next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                             token_logits,
@@ -1638,6 +2105,14 @@ class Generator:
                             job.prepare_logit_mask()
                             job.prepare_sampling_past_ids()
 
+                if staged is not None and positions_used < W:
+                    # The serial loop would have drawn one sampler seed per position it reached; pass 1 drew
+                    # W. Rewind the job's RNG and replay only the draws that were used, so a seeded stream
+                    # continues exactly as it would have on the serial loop
+                    job.rng.setstate(rng_state)
+                    for _ in range(positions_used):
+                        job.rng.randint(0, (1 << 32) - 1)
+
                 # Make sure outgoing state is valid if entire draft was accepted
                 if batch_states and draft_tokens is not None and rejected == 0:
                     batch_states[j].rewind(0)
@@ -1657,6 +2132,9 @@ class Generator:
 
                 accepted_lengths.append(accepted_length)
                 j += 1
+
+        if self.sparse_head is not None:
+            self._sparse_head_update(batch_jobs, accepted_lengths)
 
         # Update the draft-confidence calibration with this round's verification outcomes (any
         # draft-model mode)

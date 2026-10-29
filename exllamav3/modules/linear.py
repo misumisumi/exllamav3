@@ -7,6 +7,7 @@ from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
 from .quant.fp16 import LinearFP16Lazy
+from .quant.exl3_lib.hessian_packed import accumulate_, packed_numel
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
@@ -139,6 +140,9 @@ class Linear(Module):
         self.load_bias = load_bias
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
+        # Optional frequency-selected column subset for drafting (see modules/sparse_head.py); the
+        # regular forward never consults it
+        self.sparse_head = None
 
         # in_features_unpadded < in_features is handled at runtime: inputs narrower than the
         # (padded) weight are zero-extended in forward(). allow_input_padding marks layers whose
@@ -190,9 +194,15 @@ class Linear(Module):
         ss = scale_inv.shape
         if len(ss) > 0:
             assert len(ws) == len(ss) == 2
-            assert all(w == s * 128 for w, s in zip(ws, ss))
-            weight = weight.view(ss[0], 128, ss[1], 128)
-            scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+            assert all(s == (w + 127) // 128 for w, s in zip(ws, ss)), \
+                f"fp8 scale grid {tuple(ss)} does not cover a {tuple(ws)} weight in 128x128 blocks"
+            if all(w == s * 128 for w, s in zip(ws, ss)):
+                weight = weight.view(ss[0], 128, ss[1], 128)
+                scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+            else:
+                # A dimension that is not a multiple of 128 ends in a partial block (Ling's MTP
+                # head gate: 64 rows); expand the grid over whole blocks and crop
+                scale_inv = scale_inv.repeat_interleave(128, 0)[:ws[0]].repeat_interleave(128, 1)[:, :ws[1]]
         weight = weight.float() * scale_inv
         return weight.view(ws).half()
 
@@ -241,8 +251,13 @@ class Linear(Module):
             self.used_alt_key = key == self.alt_key
             if self.used_alt_key and isinstance(key, list):
                 dev = self.device
-                weight = [self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True) for k in key]
-                bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key] if self.load_bias else [None] * len(key)
+                weight = []
+                for k in key:
+                    # fp8 parts (Ling 3.x q/k/v) carry their own block scales: dequantize each before the concat
+                    w = self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True)
+                    scale_inv = self.config.stc.get_tensor(k + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                    weight.append(self.apply_fp8_scales_inv_(w, scale_inv) if scale_inv is not None else w)
+                bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
                 weight = torch.cat(weight, dim = -1)
                 bias = torch.cat(bias, dim = -1) if bias[0] is not None else None
             else:
@@ -566,7 +581,10 @@ class Linear(Module):
             if not t.is_contiguous():
                 t = t.contiguous()
             nbytes = t.numel() * t.element_size()
-            inner._pinned_arena = PinnedArena(nbytes, f"Pinned weights of {self.key}", mapped = True, required = True)
+            # Registered memory belongs to the device current at registration, and the alias must be
+            # on that device. The current device is otherwise whatever the loading thread last used
+            with torch.cuda.device(device):
+                inner._pinned_arena = PinnedArena(nbytes, f"Pinned weights of {self.key}", mapped = True, required = True)
             p = inner._pinned_arena.tensor[:nbytes].view(t.dtype).view(t.shape)
             p.copy_(t)
             return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
@@ -587,11 +605,21 @@ class Linear(Module):
             self.inner.unload()
         self.device = None
         self.inner = None
+        self.sparse_head = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
 
 
     @override
+    def make_sparse_head(self, capacity: int, vocab_size: int | None = None, **kwargs):
+        """Attach a SparseHead mirroring this layer's columns (requires a loaded inner with column extraction)"""
+        from .sparse_head import SparseHead
+        assert self.inner is not None and hasattr(self.inner, "reconstruct_columns"), \
+            f"{self.key}: sparse head needs a loaded EXL3 or fp16 layer"
+        self.sparse_head = SparseHead(self, capacity, vocab_size or self.out_features_unpadded, **kwargs)
+        return self.sparse_head
+
+
     def get_tensors(self):
         if self.device:
             return self.inner.get_tensors(self.key)
@@ -656,8 +684,13 @@ class Linear(Module):
 
 
     def init_H_data(self, init_tensor: bool):
+        # The capture accumulates into the block-packed upper triangle (hessian_packed); the full matrix is
+        # reconstructed when the tensor is finalized. The uncalibrated placeholder stays a meta (in, in) matrix
         return {
-            "H": torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = self.device if init_tensor else "meta"),
+            "H": torch.zeros(packed_numel(self.in_features), dtype = torch.float32, device = self.device) if init_tensor else
+                 torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = "meta"),
+            "packed": init_tensor,
+            "n": self.in_features,
             "first_key": self.key,
             "count": 0,
             "finalized": False,
@@ -677,7 +710,7 @@ class Linear(Module):
         if params["capture"][self.qmap]["first_key"] == self.key:
             rows = np.prod(x.shape[:-1])
             dim = x.shape[-1]
-            x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
+            x = x.reshape((rows, dim))
 
             # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
@@ -687,7 +720,7 @@ class Linear(Module):
                 x = x[finite]
                 rows = x.shape[0]
 
-            params["capture"][self.qmap]["H"].addmm_(x.T, x)
+            accumulate_(params["capture"][self.qmap]["H"], x)
             params["capture"][self.qmap]["count"] += rows
 
 
@@ -716,7 +749,11 @@ class Linear(Module):
             x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))
 
         if self.qmap and "capture" in params:
-            self.capture_H(x, params)
+            # A capture split into passes (convert_model.capture_passes) names the qmaps of the
+            # current pass; everything else runs without accumulating
+            pass_qmaps = params.get("capture_qmaps")
+            if pass_qmaps is None or self.qmap in pass_qmaps:
+                self.capture_H(x, params)
 
         if self.lora_a_tensors:
             lora_input = x

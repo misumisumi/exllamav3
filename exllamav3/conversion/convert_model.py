@@ -7,6 +7,7 @@ from ..modules import Linear, Embedding
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers, quantize_exl3
+from ..modules.quant.exl3_lib.hessian_packed import packed_numel
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -75,11 +76,11 @@ parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Work
 parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory")
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
-parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py), used in place of the budgeted allocation from --bits / --head_bits.")
+parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py, or hand-written), used in place of the budgeted allocation from --bits / --head_bits. Tensor keys may be wildcard patterns, resolved top to bottom (later entries override).")
 parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "Bits per weight, output (head) layer: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 6")
 parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
-parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
+parser.add_argument("-hq", "--hq", type = int, nargs = "?", const = 1, default = 0, help = "Increase bitrate of select layers for supported models (MoE mostly): each promoted module's floor rises by its select_hq_bits above the base rate; -hq 2 doubles the promotion (-hq N: N times)")
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
 parser.add_argument("-eb", "--embed_bits", type = int, default = None, help = "Bits per weight, token embedding table: 1-8, or 16 to store unquantized, default: 16")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
@@ -213,8 +214,11 @@ def prepare(args) -> (dict, dict, bool, str):
         if not os.path.isfile(args.recipe):
             return None, None, False, f"Recipe file not found: {args.recipe}"
         import yaml
-        with open(args.recipe, "r", encoding = "utf8") as f:
-            recipe = yaml.safe_load(f)
+        try:
+            with open(args.recipe, "r", encoding = "utf8") as f:
+                recipe = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            return None, None, False, f"Recipe is not valid YAML (keys starting with '*' must be quoted):\n{e}"
         recipe_tensors = recipe.get("tensors") if isinstance(recipe, dict) else None
         if not isinstance(recipe_tensors, dict) or not recipe_tensors:
             return None, None, False, "Recipe must contain a non-empty 'tensors' mapping"
@@ -232,7 +236,7 @@ def prepare(args) -> (dict, dict, bool, str):
         if args.bits is not None:
             print(" !! Warning: --recipe given, --bits is used for reporting only")
         if args.hq:
-            print(" !! Warning: --hq has no effect with --recipe")
+            print(" !! Warning: with --recipe, --hq only applies to MTP layers")
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
@@ -278,7 +282,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("head_bits", False, recipe_head_bits or 6),
         ("mtp_bits", True, 4),
         ("vision_bits", True, 0),  # 0 = auto: architecture's default_vision_bits cap, or 16
-        ("hq", False, False),
+        ("hq", False, 0),
         ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
         ("ngram_file", False, ""),
         ("embed_bits", False, 16),
@@ -311,6 +315,9 @@ def prepare(args) -> (dict, dict, bool, str):
             in_args[arg_] = int(v)
         elif not (half_ok and v in HALF_RATES):
             return None, None, False, f"--{arg_} must be an integer 1-8, 16, or one of {HALF_RATES} with the mul1 codebook, got {v}"
+    in_args["hq"] = int(in_args["hq"] or 0)   # jobs saved by older versions hold a bool
+    if in_args["hq"] < 0:
+        return None, None, False, f"--hq must be a positive promotion multiplier, got {in_args['hq']}"
     if in_args["embed_bits"] != 16 and not 1 <= in_args["embed_bits"] <= 8:
         return None, None, False, f"--embed_bits must be an integer 1-8, or 16, got {in_args['embed_bits']}"
     if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for v in recipe_tensors.values()):
@@ -1092,82 +1099,101 @@ def run_row_workers(title, num_rows, workers, progress_count):
         raise errors[0]
 
 
-
-# Row batching for the calibration forwards (--calib_batch_rows). Rows are independent sequences of equal
-# length, so stacking them along the batch dim gives the same per-row outputs, and the Hessian proxy is a
-# plain sum over tokens (only fp32 summation order differs). Reference rows, rows already excluded, and rows
-# carrying quant_preserve state keep the original one-row path.
-CALIB_BATCH = 1
-
-
-def _row_batchable(i, bad_rows, get_preserve):
-    if i < num_ref_states or i in bad_rows:
-        return False
-    p = {}
-    get_preserve(i, p)
-    return len(p) == 1 and not p.get("quant_preserve")
-
-
-def calib_chunks(rows, bad_rows, get_preserve, allow = True):
-    rows = list(rows)
-    n = CALIB_BATCH if allow else 1
-    pos = 0
-    while pos < len(rows):
-        i = rows[pos]
-        if n <= 1 or not _row_batchable(i, bad_rows, get_preserve):
-            yield "one", i
-            pos += 1
+def capture_passes(module, devices, headroom_min = 1536 << 20, headroom_frac = 0.06):
+    """
+    Split a module's Hessian capture into passes whose block-packed fp32 Hessians fit beside the loaded weights on
+    every device: a block-sparse layer captures one Hessian per expert down projection, which for hundreds of wide
+    experts is several times the weights. Returns one qmap set per pass, or [None] for a single
+    unrestricted pass. Measured after the module (and its replicas) are loaded; the headroom covers the
+    activations of the forward pass and the allocator's rounding of the Hessians.
+    """
+    sizes = {}
+    for m in module:
+        if isinstance(m, Linear) and m.qmap and m.qmap not in sizes:
+            sizes[m.qmap] = packed_numel(m.in_features) * 4
+    total = sum(sizes.values())
+    budget = None
+    for dev in devices:
+        d = torch.device(dev)
+        if d.type != "cuda":
             continue
-        chunk = []
-        while pos < len(rows) and len(chunk) < n and _row_batchable(rows[pos], bad_rows, get_preserve):
-            chunk.append(rows[pos])
-            pos += 1
-        if len(chunk) == 1:
-            yield "one", chunk[0]
-        else:
-            yield "batch", chunk
+        free, capacity = torch.cuda.mem_get_info(d)
+        b = free - max(headroom_min, int(capacity * headroom_frac))
+        budget = b if budget is None else min(budget, b)
+    if budget is None or total <= budget:
+        return [None]
+    budget = max(budget, max(sizes.values()))
+    passes, current, current_bytes = [], set(), 0
+    for qmap, nbytes in sizes.items():
+        if current and current_bytes + nbytes > budget:
+            passes.append(current)
+            current, current_bytes = set(), 0
+        current.add(qmap)
+        current_bytes += nbytes
+    if current:
+        passes.append(current)
+    print(f" -- Capturing in {len(passes)} passes: {total / 2**30:.1f} GB of Hessians, {budget / 2**30:.1f} GB free")
+    return passes
 
 
-def run_calib_chunks(rows, bad_rows, get_preserve, one, batch, allow = True):
-    batch_limit = CALIB_BATCH if allow else 1
-    for kind, item in calib_chunks(rows, bad_rows, get_preserve, allow):
-        if kind == "one":
-            one(item)
-            continue
-        pending = [item[i:i + batch_limit] for i in range(0, len(item), batch_limit)]
-        while pending:
-            chunk = pending.pop(0)
-            if len(chunk) == 1:
-                one(chunk[0])
+def capture_module_serial(
+    model,
+    module,
+    state,
+    original_input_ids,
+    get_preserve,
+    put_preserve,
+    slicing,
+    current_slice,
+    title,
+    bad_rows,
+    capture_qmaps = None,
+    ref_pass = True,
+):
+    """Single-device Hessian capture over all calibration rows; see capture_module_parallel"""
+    capture_H = {}
+    capture_sens = {}
+    ref_states = {}
+    with ProgressBar(title, len(state)) as progress:
+        for i in range(len(state)):
+            progress.update(i)
+            if i in bad_rows:
                 continue
-            retry = False
-            try:
-                batch(chunk)
-            except torch.cuda.OutOfMemoryError:
-                batch_limit = max(1, len(chunk) // 2)
-                middle = len(chunk) // 2
-                pending[0:0] = [chunk[:middle], chunk[middle:]]
-                retry = True
-            if retry:
-                torch.cuda.empty_cache()
-
-
-def batch_input_ids(original_input_ids, chunk):
-    ids = [original_input_ids[i] for i in chunk]
-    return torch.stack(ids, 0) if ids[0].dim() == 1 else torch.cat(ids, 0)
-
-
-def batch_states(state, chunk):
-    xs = [state[i] for i in chunk]
-    dev = xs[0].device
-    xs = [x.to(dev) for x in xs]
-    return torch.stack(xs, 0) if xs[0].dim() == 2 else torch.cat(xs, 0)
-
-
-def unbatch_states(rs, chunk, state):
-    if state[chunk[0]].dim() == 2:
-        return [rs[j] for j in range(len(chunk))]
-    return [rs[j:j + 1] for j in range(len(chunk))]
+            params = {
+                "attn_mode": "flash_attn_nc",
+                "capture": capture_H,
+                "capture_sens": capture_sens,
+                "activate_all_experts": model.calibration_all_experts,
+                "input_ids": original_input_ids[i],
+            }
+            if capture_qmaps is not None:
+                params["capture_qmaps"] = capture_qmaps
+            if slicing:
+                 params["q_mlp_slice"] = current_slice
+            get_preserve(i, params)
+            rs = module.prepare_for_device(state[i], params)
+            rs = module.forward(rs, params)
+            put_preserve(i, params)
+            if ref_pass and i < num_ref_states:
+                if model.calibration_all_experts:
+                    # Do not activate all experts for reference state, for error measurement
+                    params = {
+                        "attn_mode": "flash_attn_nc",
+                        "input_ids": original_input_ids[i],
+                    }
+                    if slicing:
+                        params["q_mlp_slice"] = current_slice
+                    get_preserve(i, params)
+                    rs = module.prepare_for_device(state[i], params)
+                    rs = module.forward(rs, params)
+                    put_preserve(i, params)
+                if torch.isfinite(rs).all().item():
+                    ref_states[i] = rs.cpu()
+                else:
+                    bad_rows.add(i)
+                    print(f" !! Non-finite reference state in calibration row {i}, excluding row")
+            rs = None
+    return capture_H, capture_sens, ref_states
 
 
 def capture_module_parallel(
@@ -1183,12 +1209,15 @@ def capture_module_parallel(
     current_slice,
     title,
     bad_rows,
+    capture_qmaps = None,
+    ref_pass = True,
 ):
     """
     Run the Hessian-capture forward pass with calibration rows split across devices, each device forwarding its
     shard through its own replica of the module. Per-device capture dicts are merged by summing H (the proxy is
     a plain sum over token batches), counts and inf/nan counters onto the primary device. The output sensitivity
-    accumulators of the gated MLPs merge the same way.
+    accumulators of the gated MLPs merge the same way. capture_qmaps limits the pass to a subset of the module's
+    Hessians (see capture_passes); the reference states are collected on the first pass only.
     """
     shards = calibration_row_shards(len(state), devices, device_ratios)
     captures = [{} for _ in modules]
@@ -1216,13 +1245,15 @@ def capture_module_parallel(
                     "activate_all_experts": model.calibration_all_experts,
                     "input_ids": original_input_ids[i],
                 }
+                if capture_qmaps is not None:
+                    params["capture_qmaps"] = capture_qmaps
                 if slicing:
                     params["q_mlp_slice"] = current_slice
                 get_preserve(i, params)
                 rs = module.prepare_for_device(state[i], params)
                 rs = module.forward(rs, params)
                 put_preserve(i, params)
-                if i < num_ref_states:
+                if ref_pass and i < num_ref_states:
                     if model.calibration_all_experts:
                         # Do not activate all experts for reference state, for error measurement
                         params = {
@@ -1553,6 +1584,28 @@ def main(args, job_state):
         if ext_hin:
             use_reference_state = False
 
+    # Get quantization strategy for model @bitrate. Decided before any calibration work so a recipe that
+    # doesn't cover the model fails up front
+    print(" -- Deciding quantization strategy")
+    hq = args["hq"]
+    if args.get("recipe_strategy"):
+        print(f"    Applying recipe: {args.get('recipe')}")
+        strategy, final_bpw = create_q_strategy_from_recipe(
+            model, mtp_model, config, args["recipe_strategy"], args["head_bits"], args["mtp_bits"],
+            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+            hq = hq, half_steps = args["codebook"] == "mul1",
+        )
+    else:
+        strategy, final_bpw = create_q_strategy(
+            model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
+            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+            half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
+        )
+    args["final_bits"] = round(final_bpw, 2)
+    print(" -- Quantization strategy, summary:")
+    print(print_strategy(strategy))
+    print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (f" (--hq {hq} enabled)" if hq > 1 else " (--hq enabled)" if hq else ""))
+
     # Models with a hashed n-gram embedding table get it quantized (or copied from --ngram_file)
     # into the output directory up front, so the calibration forward pass runs on the quantized
     # table; resumable and skipped when already complete
@@ -1594,26 +1647,6 @@ def main(args, job_state):
 
     def put_preserve(si, params_):
         quant_preserves[si] = params_["quant_preserve"]
-
-    # Get quantization strategy for model @bitrate
-    print(" -- Deciding quantization strategy")
-    hq = args["hq"]
-    if args.get("recipe_strategy"):
-        print(f"    Applying recipe: {args.get('recipe')}")
-        strategy, final_bpw = create_q_strategy_from_recipe(
-            model, mtp_model, config, args["recipe_strategy"], args["head_bits"], args["mtp_bits"],
-            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
-        )
-    else:
-        strategy, final_bpw = create_q_strategy(
-            model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
-            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
-            half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
-        )
-    args["final_bits"] = round(final_bpw, 2)
-    print(" -- Quantization strategy, summary:")
-    print(print_strategy(strategy))
-    print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (" (--hq enabled)" if hq else ""))
 
     # With multiple devices, run the capture and state-advance forward passes with calibration rows split
     # across replicas of the current module, one per device. Calibration rows are independent and the H proxy
@@ -1698,66 +1731,63 @@ def main(args, job_state):
                     capture_replicas = None
                     if parallel_calib and not module.caps.get("prefer_cpu"):
                         capture_replicas = load_parallel_calib_modules(
-                            replica_models, idx, calib_devices, current_slice if slicing else None)
+                            replica_models, idx, devices, current_slice if slicing else None)
+                    # Hessians that will not fit beside the weights are captured in passes, each
+                    # swapped to system RAM before the next (see capture_passes)
+                    free_mem()
+                    passes = capture_passes(module, devices if capture_replicas is not None else [module.device])
+                    capture_H = {}
+                    capture_sens = {}
+                    ref_states = {}
+                    for pass_idx, pass_qmaps in enumerate(passes):
+                        pass_str = f" (pass {pass_idx + 1}/{len(passes)})" if len(passes) > 1 else ""
+                        title = f" -- Capturing: {module.key}" + slice_str + pass_str
+                        if capture_replicas is not None:
+                            pass_H, pass_sens, pass_ref = capture_module_parallel(
+                                model,
+                                [module] + capture_replicas,
+                                devices,
+                                eff_ratios("calib"),
+                                state,
+                                original_input_ids,
+                                get_preserve,
+                                put_preserve,
+                                slicing,
+                                current_slice,
+                                title,
+                                bad_rows,
+                                pass_qmaps,
+                                pass_idx == 0,
+                            )
+                        else:
+                            pass_H, pass_sens, pass_ref = capture_module_serial(
+                                model,
+                                module,
+                                state,
+                                original_input_ids,
+                                get_preserve,
+                                put_preserve,
+                                slicing,
+                                current_slice,
+                                title,
+                                bad_rows,
+                                pass_qmaps,
+                                pass_idx == 0,
+                            )
+                        # Swap captured H to system RAM
+                        for k, v in pass_H.items():
+                            v["H_swap_device"] = v["H"].device
+                            v["H"] = v["H"].cpu()
+                        capture_H.update(pass_H)
+                        merge_out_sensitivity(capture_sens, pass_sens)
+                        ref_states.update(pass_ref)
+                        pass_H = pass_sens = pass_ref = None
+                        if len(passes) > 1:
+                            free_mem()
                     if capture_replicas is not None:
-                        capture_H, capture_sens, ref_states = capture_module_parallel(
-                            model,
-                            [module] + capture_replicas,
-                            calib_devices,
-                            calib_ratios(),
-                            state,
-                            original_input_ids,
-                            get_preserve,
-                            put_preserve,
-                            slicing,
-                            current_slice,
-                            f" -- Capturing: {module.key}" + slice_str,
-                            bad_rows,
-                        )
                         for rep in capture_replicas:
                             rep.unload()
                         free_mem()
-                    else:
-                        with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
-                            capture_H = {}
-                            capture_sens = {}
-                            ref_states = {}
-                            for i in range(len(state)):
-                                progress.update(i)
-                                if i in bad_rows:
-                                    continue
-                                params = {
-                                    "attn_mode": "flash_attn_nc",
-                                    "capture": capture_H,
-                                    "capture_sens": capture_sens,
-                                    "activate_all_experts": model.calibration_all_experts,
-                                    "input_ids": original_input_ids[i],
-                                }
-                                if slicing:
-                                     params["q_mlp_slice"] = current_slice
-                                get_preserve(i, params)
-                                rs = module.prepare_for_device(state[i], params)
-                                rs = module.forward(rs, params)
-                                put_preserve(i, params)
-                                if i < num_ref_states:
-                                    if model.calibration_all_experts:
-                                        # Do not activate all experts for reference state, for error measurement
-                                        params = {
-                                            "attn_mode": "flash_attn_nc",
-                                            "input_ids": original_input_ids[i],
-                                        }
-                                        if slicing:
-                                            params["q_mlp_slice"] = current_slice
-                                        get_preserve(i, params)
-                                        rs = module.prepare_for_device(state[i], params)
-                                        rs = module.forward(rs, params)
-                                        put_preserve(i, params)
-                                    if torch.isfinite(rs).all().item():
-                                        ref_states[i] = rs.cpu()
-                                    else:
-                                        bad_rows.add(i)
-                                        print(f" !! Non-finite reference state in calibration row {i}, excluding row")
-                                rs = None
                     print(f" -- Captured: {module.key}" + slice_str, flush = True)
 
                     # More feedback
@@ -1774,11 +1804,6 @@ def main(args, job_state):
                         if infs or nans:
                             numel = v["num_total"]
                             print(f" !! Warning: {k} state has {infs:,} inf values and {nans:,} NaN values (out of {numel:,})")
-
-                    # Swap captured H to system RAM
-                    for k, v in capture_H.items():
-                        v["H_swap_device"] = v["H"].device
-                        v["H"] = v["H"].cpu()
 
             # Get submodules to quantize
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]

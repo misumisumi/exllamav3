@@ -156,7 +156,10 @@ BC_Attention::BC_Attention
         qkv_n_stride = meta.select(0, 3).contiguous().to(dev);
         qkv_had_src = meta.select(0, 4).contiguous().to(dev);
         int width = meta[2][0].item<int>();
-        qkv_carrier = at::empty({slices, MAX_BSZ * MAX_QLEN, width}, at::TensorOptions().dtype(at::kHalf).device(dev));
+        // Sliced mode writes every slice through qkv_c_ptrs, so the carrier is never touched and
+        // needs no backing beyond one element: a zero-stride expansion to the shape mgemm checks
+        qkv_carrier = at::empty({1, 1, 1}, at::TensorOptions().dtype(at::kHalf).device(dev))
+                      .expand({slices, MAX_BSZ * MAX_QLEN, width});
     }
 }
 
@@ -711,6 +714,10 @@ void BC_Attention::run_gr
         // Eager calls scan only the freshly scored [0, t_scan): the static's tail can hold
         // scores from an earlier, longer sequence. Graphs patch the scan width per replay
         const at::Tensor qsa_scores = graph ? s.qsa_scores : s.qsa_scores.narrow(1, 0, t_scan);
+        // See BC_MLAttention::run_gr: the eager pass has to allocate the split top-k workspace the captured
+        // full-width scan will use
+        if (!graph)
+            dsa_topk_prepare(s.qsa_scores, (int) s.qsa_pool_idx.size(1));
         dsa_topk_gr(qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
         {
             std::vector<void*> args =

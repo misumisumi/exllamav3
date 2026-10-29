@@ -18,6 +18,7 @@ from .exaone4 import Exaone4Model
 from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
 from .gemma4 import Gemma4TextModel, Gemma4UnifiedTextModel
+from .gemma4_assistant import Gemma4AssistantModel
 from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
@@ -32,9 +33,11 @@ from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
 from .kimi_linear import KimiLinearModel
 from .k2_horizon import K2HorizonModel
+from .bailing_hybrid import BailingHybridModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
+from .lfm2_vl import Lfm2VlTextModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .mimo_v2 import MiMoV2Model
@@ -46,7 +49,7 @@ from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
 from .muse_glimmer import MuseGlimmerTextModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantModel
-from .nemotronh import NemotronHModel
+from .nemotronh import NemotronHModel, NemotronHOmniModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
@@ -94,6 +97,7 @@ ARCHITECTURES = {
         Gemma3Model,
         Gemma3TextModel,
         Gemma4TextModel,
+        Gemma4AssistantModel,
         Gemma4UnifiedTextModel,
         Glm4Model,
         Glm4MoeModel,
@@ -104,6 +108,7 @@ ARCHITECTURES = {
         Glm5NextModel,
         KimiLinearModel,
         K2HorizonModel,
+        BailingHybridModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
@@ -112,6 +117,7 @@ ARCHITECTURES = {
         LagunaModel,
         Lfm2Model,
         Lfm2MoeModel,
+        Lfm2VlTextModel,
         LlamaModel,
         MiMoModel,
         MiMoV2Model,
@@ -124,6 +130,7 @@ ARCHITECTURES = {
         MuseGlimmerTextModel,
         MuseGlimmerAssistantModel,
         NemotronHModel,
+        NemotronHOmniModel,
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,
