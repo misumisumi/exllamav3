@@ -2078,9 +2078,7 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        mismatch_ = (not pre_match[i]) if pre_match is not None else \
-                            (draft_tokens[j, i].item() != sampled_token.item())
-                        if mismatch_ or cp_boundary:
+                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
